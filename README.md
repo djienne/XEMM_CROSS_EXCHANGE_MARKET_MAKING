@@ -135,10 +135,11 @@ src/
 ├── main.rs             # Main trading bot binary
 ├── lib.rs              # Library exports
 ├── config.rs           # Config management (loads config.json)
+├── csv_logger.rs       # CSV logging for trade history
 ├── trade_fetcher.rs    # Post-hedge trade fetching and profit calculation
 ├── bot/
 │   ├── mod.rs
-│   └── state.rs        # Bot state machine (Idle/Active/Filled/Hedged/Error)
+│   └── state.rs        # Bot state machine (Idle/OrderPlaced/Filled/Hedging/Complete/Error)
 ├── strategy/
 │   ├── mod.rs
 │   └── opportunity.rs  # Opportunity evaluation and profit calculation
@@ -179,24 +180,26 @@ examples/
 The bot uses a state machine to track lifecycle:
 
 - **Idle** - Waiting for opportunity, no active order
-- **Active** - Order placed on Pacifica, monitoring for fill
+- **OrderPlaced** - Order placed on Pacifica, monitoring for fill
 - **Filled** - Order filled, waiting for hedge execution
-- **Hedged** - Hedge executed successfully
+- **Hedging** - Hedge being executed on Hyperliquid
 - **Complete** - Cycle complete, bot exits
 - **Error** - Unrecoverable error occurred
 
-### 8 Concurrent Tasks
+### 10 Concurrent Tasks
 
-The XEMM bot orchestrates 8 async tasks running in parallel:
+The XEMM bot orchestrates 10 async tasks running in parallel:
 
 1. **Pacifica Orderbook (WebSocket)** - Real-time bid/ask feed
 2. **Hyperliquid Orderbook (WebSocket)** - Real-time bid/ask feed
-3. **Fill Detection (WebSocket)** - Monitors Pacifica order fills/cancellations
-4. **Pacifica REST API Polling** - Fallback orderbook data (every 4s)
-5. **Order Monitoring** - Profit tracking and order refresh (every 25ms)
+3. **Fill Detection (WebSocket)** - Monitors Pacifica order fills/cancellations (primary + position delta)
+4. **Pacifica REST API Polling** - Fallback orderbook data (every 2s)
+4.5. **Hyperliquid REST API Polling** - Fallback orderbook data (every 2s)
+5. **REST API Fill Detection** - Backup fill polling (every 500ms)
 5.5. **Position Monitor** - Position-based fill detection (every 500ms, ground truth)
-6. **Hedge Execution** - Executes Hyperliquid hedge after fill
-7. **Main Opportunity Loop** - Evaluates and places orders (every 100ms)
+6. **Order Monitoring** - Profit tracking and order refresh (every 25ms)
+7. **Hedge Execution** - Executes Hyperliquid hedge after fill
+8. **Main Opportunity Loop** - Evaluates and places orders (every 100ms)
 
 ## Configuration Parameters
 
@@ -220,7 +223,7 @@ The XEMM bot orchestrates 8 async tasks running in parallel:
 2. **Wait**: Gather initial orderbook data (3s warmup)
 3. **Evaluate**: Check both BUY and SELL opportunities every 100ms
 4. **Place**: If profitable (>target profit), place limit order on Pacifica
-5. **Monitor**: Track profit every 25ms, cancel if deviation >3 bps or age >30s
+5. **Monitor**: Track profit every 25ms, cancel if deviation >3 bps or age >60s
 6. **Fill Detection**: 5-layer system detects when order fills
    - WebSocket fill detection (primary, real-time via account_order_updates)
    - WebSocket position detection (redundancy, real-time via account_positions)
@@ -264,11 +267,17 @@ cargo run --example pacifica_orderbook_rest_test --release
 # Test fill detection WebSocket
 cargo run --example fill_detection_test --release
 
+# Test REST API fill detection
+cargo run --example test_rest_fill_detection --release
+
 # Test Hyperliquid market orders
 cargo run --example hyperliquid_market_test --release
 
 # View Hyperliquid orderbook
 cargo run --example hyperliquid_orderbook --release
+
+# Test Hyperliquid L2 snapshot
+cargo run --example test_hl_l2_snapshot --release
 
 # Calculate opportunities without trading
 cargo run --example xemm_calculator --release
@@ -355,7 +364,9 @@ cargo run --example test_price_rounding --release
 
 # Fetch and analyze recent trade history
 cargo run --example fetch_recent_trades --release
+cargo run --example fetch_pump_trades --release
 cargo run --example test_hyperliquid_trade_history --release
+cargo run --example test_pacifica_trade_history --release
 
 # Cross-exchange position rebalancer
 cargo run --example rebalancer --release
