@@ -505,15 +505,15 @@ impl HyperliquidTrading {
         Ok(fills)
     }
 
-    /// Get user state (positions and balances)
+    /// Get user state (positions and margin summary)
     ///
     /// # Arguments
-    /// * `user` - User wallet address
+    /// * `user` - User wallet address in 42-character hexadecimal format
     ///
     /// # Returns
-    /// UserStateResponse containing positions and account summary
-    pub async fn get_user_state(&self, user: &str) -> Result<UserStateResponse> {
-        info!("[HYPERLIQUID] Fetching user state for {}", user);
+    /// User state with positions, margin summary, and account info
+    pub async fn get_user_state(&self, user: &str) -> Result<UserState> {
+        debug!("[HYPERLIQUID] Fetching user state for {}", user);
 
         let payload = json!({
             "type": "clearinghouseState",
@@ -529,13 +529,19 @@ impl HyperliquidTrading {
             .context("Failed to fetch user state")?;
 
         let response_text = response.text().await?;
-        debug!("[HYPERLIQUID] User state response: {}", response_text);
+        debug!("[HYPERLIQUID] User state response (first 500 chars): {}",
+            &response_text.chars().take(500).collect::<String>());
 
-        let user_state: UserStateResponse = serde_json::from_str(&response_text)
+        let user_state: UserState = serde_json::from_str(&response_text)
             .with_context(|| format!("Failed to parse user state response: {}", response_text))?;
 
-        debug!("[HYPERLIQUID] Retrieved user state with {} position(s)", user_state.asset_positions.len());
+        debug!("[HYPERLIQUID] Retrieved {} position(s)", user_state.asset_positions.len());
 
         Ok(user_state)
+    }
+
+    /// Get wallet address from the internal wallet
+    pub fn get_wallet_address(&self) -> String {
+        format!("{:?}", self.wallet.address())
     }
 }

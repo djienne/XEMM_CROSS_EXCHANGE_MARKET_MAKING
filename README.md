@@ -12,6 +12,17 @@ A high-performance Rust trading bot that performs single-cycle arbitrage between
 - ✅ **Order Refresh** - Auto-cancels stale orders based on age
 - ✅ **Single-cycle Mode** - Exits after one successful arbitrage cycle
 
+### Fill Detection (4 Layers)
+
+The bot uses a multi-layered fill detection system for maximum reliability:
+
+1. **WebSocket Fill Detection** (primary, real-time) - Monitors Pacifica's `account_order_updates` channel
+2. **REST API Order Polling** (backup, 500ms) - Polls order status via REST API
+3. **Position Monitor** (ground truth, 500ms) - Detects fills by monitoring position changes
+4. **Monitor Safety Check** (defensive) - Pre-cancellation verification in monitoring task
+
+All methods deduplicate via shared HashSet to ensure only one hedge executes per fill.
+
 ### Exchange Connectivity
 
 **Pacifica:**
@@ -20,11 +31,13 @@ A high-performance Rust trading bot that performs single-cycle arbitrage between
 - WebSocket trading (ultra-fast order cancellation, no rate limits)
 - REST API trading (authenticated order placement/cancellation)
 - REST API polling (fallback orderbook data)
+- REST API positions (position monitoring for fill detection)
 - Ed25519 authenticated operations (both WebSocket and REST)
 - **Dual cancellation safety** - Uses both REST + WebSocket for redundancy
 
 **Hyperliquid:**
 - WebSocket orderbook (real-time L2 book)
+- REST API positions (clearinghouse state for position verification)
 - EIP-712 authenticated trading (market orders)
 - Automatic slippage protection
 
@@ -126,10 +139,21 @@ src/
         └── trading.rs         # REST API trading (market orders)
 
 examples/
-├── pacifica_orderbook_rest_test.rs    # Test REST API orderbook
-├── fill_detection_test.rs             # Test fill detection
-├── hyperliquid_market_test.rs         # Test Hyperliquid trading
-└── xemm_calculator.rs                 # Price calculator (no trading)
+├── pacifica_orderbook.rs                      # View Pacifica orderbook (live)
+├── pacifica_orderbook_rest_test.rs            # Test REST API orderbook
+├── fill_detection_test.rs                     # Test fill detection
+├── test_aggressive_fill_detection.rs          # Test all 4 fill detection methods
+├── hyperliquid_market_test.rs                 # Test Hyperliquid trading
+├── hyperliquid_orderbook.rs                   # View Hyperliquid orderbook
+├── xemm_calculator.rs                         # Price calculator (no trading)
+├── test_pacifica_positions.rs                 # View Pacifica positions
+├── check_positions_debug.rs                   # Debug Hyperliquid positions
+├── test_hyperliquid_trade_history.rs          # Test trade history API
+├── rebalancer.rs                              # Position rebalancer (single exchange)
+├── rebalancer_cross_exchange.rs               # Cross-exchange rebalancer
+├── cancel_all_test.rs                         # Test REST cancel all
+├── ws_cancel_all_test.rs                      # Test WebSocket cancel all
+└── ... (30+ more examples for testing)
 ```
 
 ### Bot State Machine
@@ -143,15 +167,16 @@ The bot uses a state machine to track lifecycle:
 - **Complete** - Cycle complete, bot exits
 - **Error** - Unrecoverable error occurred
 
-### 7 Concurrent Tasks
+### 8 Concurrent Tasks
 
-The XEMM bot orchestrates 7 async tasks running in parallel:
+The XEMM bot orchestrates 8 async tasks running in parallel:
 
 1. **Pacifica Orderbook (WebSocket)** - Real-time bid/ask feed
 2. **Hyperliquid Orderbook (WebSocket)** - Real-time bid/ask feed
 3. **Fill Detection (WebSocket)** - Monitors Pacifica order fills/cancellations
 4. **Pacifica REST API Polling** - Fallback orderbook data (every 4s)
 5. **Order Monitoring** - Profit tracking and order refresh (every 25ms)
+5.5. **Position Monitor** - Position-based fill detection (every 500ms, ground truth)
 6. **Hedge Execution** - Executes Hyperliquid hedge after fill
 7. **Main Opportunity Loop** - Evaluates and places orders (every 100ms)
 
@@ -178,10 +203,17 @@ The XEMM bot orchestrates 7 async tasks running in parallel:
 3. **Evaluate**: Check both BUY and SELL opportunities every 100ms
 4. **Place**: If profitable (>target profit), place limit order on Pacifica
 5. **Monitor**: Track profit every 25ms, cancel if deviation >3 bps or age >30s
-6. **Fill**: Fill detection WebSocket notifies when order fills
+6. **Fill Detection**: 4-layer system detects when order fills
+   - WebSocket fill detection (primary, real-time)
+   - REST API order polling (backup, 500ms)
+   - Position monitor (ground truth, 500ms)
+   - Monitor safety check (pre-cancellation)
    - **Dual Cancellation**: Immediately cancel all orders via REST + WebSocket
 7. **Hedge**: Execute market order on Hyperliquid (opposite direction)
-8. **Complete**: Display profit summary and exit
+8. **Wait**: 20-second delay for trades to propagate to exchange APIs
+9. **Fetch**: Retrieve actual fill data from both exchanges with retry logic
+10. **Calculate**: Compute actual profit using real fills and fees
+11. **Complete**: Display comprehensive profit summary and exit
 
 ## Opportunity Calculation
 
@@ -229,6 +261,25 @@ cargo run --example advanced_usage --release
 cargo run --example low_latency --release
 ```
 
+### Fill Detection Testing
+
+Comprehensive test for the 4-layer fill detection system:
+
+```bash
+# Test all 4 fill detection methods with aggressive limit order
+# Places order at 0.05% spread to ensure quick fill
+# Verifies deduplication and position verification on both exchanges
+cargo run --example test_aggressive_fill_detection --release
+```
+
+This test:
+- Places an aggressive post-only limit order (5 bps spread)
+- Monitors all 4 detection methods simultaneously
+- Tracks which method detects first with timing analysis
+- Verifies only one hedge executes (deduplication works)
+- Checks positions on both Pacifica and Hyperliquid after hedge
+- Shows comprehensive detection method summary
+
 ### Trading Examples
 
 Generic trading examples (educational):
@@ -255,6 +306,12 @@ cargo run --example ws_cancel_all_test --release
 # Check available Hyperliquid symbols
 cargo run --example check_hyperliquid_symbols --release
 
+# View current positions on Pacifica
+cargo run --example test_pacifica_positions --release
+
+# Debug Hyperliquid positions (raw API response)
+cargo run --example check_positions_debug --release
+
 # Close ENA position helper
 cargo run --example close_ena_position --release
 
@@ -270,6 +327,14 @@ cargo run --example test_meta_parse --release
 
 # Test price rounding logic
 cargo run --example test_price_rounding --release
+
+# Fetch and analyze recent trade history
+cargo run --example fetch_recent_trades --release
+cargo run --example test_hyperliquid_trade_history --release
+
+# Cross-exchange position rebalancer
+cargo run --example rebalancer --release
+cargo run --example rebalancer_cross_exchange --release
 ```
 
 ### Symbol-Specific Test Examples
@@ -383,9 +448,13 @@ The bot features colorized terminal output for easy monitoring:
 - Review spread between exchanges
 
 **Fill not detected:**
-- Check fill detection WebSocket is connected
+- The bot uses 4 independent fill detection methods for redundancy
+- Check fill detection WebSocket is connected (Task 3)
+- Verify REST API order polling is working (Task 5)
+- Check position monitor is running (Task 5.5)
 - Verify account address matches credentials
 - Enable debug logging: `RUST_LOG=debug`
+- Check that deduplication HashSet isn't preventing detection
 
 ## Deployment
 

@@ -3,6 +3,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -119,26 +120,6 @@ pub struct OrderbookSnapshot {
     pub asks: Vec<OrderbookLevel>,
 }
 
-/// Position information
-#[derive(Debug, Clone, Deserialize)]
-pub struct PositionInfo {
-    pub symbol: String,
-    pub amount: String,           // Signed size (positive = long, negative = short)
-    pub entry_price: Option<String>,
-    pub mark_price: Option<String>,
-    pub unrealized_pnl: Option<String>,
-    pub liquidation_price: Option<String>,
-}
-
-/// Positions response wrapper
-#[derive(Debug, Clone, Deserialize)]
-pub struct PositionsResponse {
-    pub success: bool,
-    pub data: Option<Vec<PositionInfo>>,
-    pub error: Option<String>,
-    pub code: Option<String>,
-}
-
 /// Trade history item from positions/history endpoint
 #[derive(Debug, Clone, Deserialize)]
 pub struct TradeHistoryItem {
@@ -168,31 +149,97 @@ pub struct TradeHistoryResponse {
     pub code: Option<String>,
 }
 
+/// Open order item from /api/v1/orders endpoint
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenOrderItem {
+    pub order_id: u64,
+    pub client_order_id: String,
+    pub symbol: String,
+    pub side: String,              // "bid" or "ask"
+    pub price: String,
+    pub initial_amount: String,
+    pub filled_amount: String,
+    pub cancelled_amount: String,
+    #[serde(default)]
+    pub stop_price: Option<String>,
+    pub order_type: String,        // "limit" or "market"
+    #[serde(default)]
+    pub stop_parent_order_id: Option<String>,
+    pub reduce_only: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+/// Open orders response from API
+#[derive(Debug, Deserialize)]
+pub struct OpenOrdersResponse {
+    pub success: bool,
+    pub data: Option<Vec<OpenOrderItem>>,
+    pub error: Option<String>,
+    pub code: Option<String>,
+}
+
+/// Position item from GET /api/v1/positions endpoint
+#[derive(Debug, Clone, Deserialize)]
+pub struct PositionItem {
+    pub symbol: String,
+    pub side: String,              // "bid" (long) or "ask" (short)
+    pub amount: String,            // Position size (always positive)
+    pub entry_price: String,       // Average entry price
+    #[serde(default)]
+    pub margin: Option<String>,    // Margin for isolated positions
+    pub funding: String,           // Funding paid since position opened
+    pub isolated: bool,            // Whether position is in isolated margin mode
+    pub created_at: u64,           // Timestamp in milliseconds
+    pub updated_at: u64,           // Timestamp in milliseconds
+}
+
+/// Position API response
+#[derive(Debug, Deserialize)]
+pub struct PositionResponse {
+    pub success: bool,
+    pub data: Option<Vec<PositionItem>>,
+    pub error: Option<String>,
+    pub code: Option<String>,
+}
+
 /// Pacifica trading client
 pub struct PacificaTrading {
     credentials: PacificaCredentials,
     rest_url: String,
     client: reqwest::Client,
-    market_info_cache: Option<HashMap<String, MarketInfo>>,
+    market_info_cache: Arc<Mutex<Option<HashMap<String, MarketInfo>>>>,
 }
 
 impl PacificaTrading {
     /// Create a new trading client (mainnet only)
-    pub fn new(credentials: PacificaCredentials) -> Self {
-        Self {
+    pub fn new(credentials: PacificaCredentials) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))        // Max 10s per request
+            .connect_timeout(std::time::Duration::from_secs(5)) // Max 5s to connect
+            .build()
+            .context("Failed to build HTTP client")?;
+
+        Ok(Self {
             credentials,
             rest_url: MAINNET_REST_URL.to_string(),
-            client: reqwest::Client::new(),
-            market_info_cache: None,
-        }
+            client,
+            market_info_cache: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// Fetch market info for all symbols
-    pub async fn get_market_info(&mut self) -> Result<&HashMap<String, MarketInfo>> {
-        if self.market_info_cache.is_some() {
-            return Ok(self.market_info_cache.as_ref().unwrap());
+    /// Uses internal caching with Mutex to allow &self (no external mutation needed)
+    pub async fn get_market_info(&self) -> Result<HashMap<String, MarketInfo>> {
+        // Check cache first
+        {
+            let cache_guard = self.market_info_cache.lock().unwrap();
+            if let Some(ref cached) = *cache_guard {
+                return Ok(cached.clone());
+            }
         }
 
+        // Cache miss - fetch from API
         let url = format!("{}/api/v1/info", self.rest_url);
         let response = self.client.get(&url).send().await?;
 
@@ -207,15 +254,20 @@ impl PacificaTrading {
 
         let api_response: ApiResponse = response.json().await?;
 
-        let mut cache = HashMap::new();
+        let mut new_cache = HashMap::new();
         for info in api_response.data {
-            cache.insert(info.symbol.clone(), info);
+            new_cache.insert(info.symbol.clone(), info);
         }
 
-        info!("[PACIFICA] Cached market info for {} symbols", cache.len());
-        self.market_info_cache = Some(cache);
+        info!("[PACIFICA] Cached market info for {} symbols", new_cache.len());
 
-        Ok(self.market_info_cache.as_ref().unwrap())
+        // Update cache
+        {
+            let mut cache_guard = self.market_info_cache.lock().unwrap();
+            *cache_guard = Some(new_cache.clone());
+        }
+
+        Ok(new_cache)
     }
 
     /// Fetch orderbook snapshot via REST API
@@ -399,7 +451,7 @@ impl PacificaTrading {
     /// * `current_bid` - Current best bid price (required if price is None)
     /// * `current_ask` - Current best ask price (required if price is None)
     pub async fn place_limit_order(
-        &mut self,
+        &self,
         symbol: &str,
         side: OrderSide,
         size: f64,
@@ -696,45 +748,6 @@ impl PacificaTrading {
     ///
     /// # Returns
     /// Vector of trade history items
-    /// Get current open positions
-    ///
-    /// # Arguments
-    /// * `symbol` - Optional symbol filter (e.g., "SOL")
-    ///
-    /// # Returns
-    /// Vector of current open positions
-    pub async fn get_positions(&self, symbol: Option<&str>) -> Result<Vec<PositionInfo>> {
-        let mut url = format!("{}/api/v1/positions?account={}",
-            self.rest_url,
-            self.credentials.account
-        );
-
-        if let Some(sym) = symbol {
-            url.push_str(&format!("&symbol={}", sym));
-        }
-
-        info!("[PACIFICA] Fetching positions from {}", url);
-
-        let response = self.client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch positions")?;
-
-        let response_text = response.text().await?;
-        debug!("[PACIFICA] Positions response: {}", response_text);
-
-        let positions_response: PositionsResponse = serde_json::from_str(&response_text)
-            .with_context(|| format!("Failed to parse positions response: {}", response_text))?;
-
-        if !positions_response.success {
-            let error_msg = positions_response.error.unwrap_or_else(|| "Unknown error".to_string());
-            anyhow::bail!("Get positions failed: {}", error_msg);
-        }
-
-        Ok(positions_response.data.unwrap_or_default())
-    }
-
     pub async fn get_trade_history(
         &self,
         symbol: Option<&str>,
@@ -791,6 +804,98 @@ impl PacificaTrading {
         }
 
         Ok(history_response.data.unwrap_or_default())
+    }
+
+    /// Get open orders for the account
+    ///
+    /// # Returns
+    /// Vector of open orders
+    pub async fn get_open_orders(&self) -> Result<Vec<OpenOrderItem>> {
+        let url = format!("{}/api/v1/orders?account={}",
+            self.rest_url,
+            self.credentials.account
+        );
+
+        debug!("[PACIFICA] Fetching open orders from {}", url);
+
+        let response = self.client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch open orders")?;
+
+        // Check for rate limiting
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            anyhow::bail!("Rate limit exceeded (429)");
+        }
+
+        let response_text = response.text().await?;
+
+        let orders_response: OpenOrdersResponse = serde_json::from_str(&response_text)
+            .with_context(|| format!("Failed to parse open orders response: {}", response_text))?;
+
+        if !orders_response.success {
+            let error_msg = orders_response.error.unwrap_or_else(|| "Unknown error".to_string());
+
+            // Check for rate limit error messages
+            if error_msg.to_lowercase().contains("rate limit") || error_msg.to_lowercase().contains("too many requests") {
+                anyhow::bail!("Rate limit exceeded: {}", error_msg);
+            }
+
+            anyhow::bail!("Get open orders failed: {}", error_msg);
+        }
+
+        Ok(orders_response.data.unwrap_or_default())
+    }
+
+    /// Get current positions for the account
+    ///
+    /// # Returns
+    /// Vector of position items
+    pub async fn get_positions(&self) -> Result<Vec<PositionItem>> {
+        let url = format!("{}/api/v1/positions?account={}",
+            self.rest_url,
+            self.credentials.account
+        );
+
+        debug!("[PACIFICA] Fetching positions from {}", url);
+
+        let response = self.client
+            .get(&url)
+            .header("Accept", "*/*")
+            .send()
+            .await
+            .context("Failed to fetch positions")?;
+
+        // Check for rate limiting
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            anyhow::bail!("Rate limit exceeded (429)");
+        }
+
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Get positions request failed: {} - {}", status, body);
+        }
+
+        let response_text = response.text().await?;
+
+        let position_response: PositionResponse = serde_json::from_str(&response_text)
+            .with_context(|| format!("Failed to parse positions response: {}", response_text))?;
+
+        if !position_response.success {
+            let error_msg = position_response.error.unwrap_or_else(|| "Unknown error".to_string());
+
+            // Check for rate limit error messages
+            if error_msg.to_lowercase().contains("rate limit") || error_msg.to_lowercase().contains("too many requests") {
+                anyhow::bail!("Rate limit exceeded: {}", error_msg);
+            }
+
+            anyhow::bail!("Get positions failed: {}", error_msg);
+        }
+
+        Ok(position_response.data.unwrap_or_default())
     }
 }
 
