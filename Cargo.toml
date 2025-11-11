@@ -29,4 +29,3 @@ ethers = { version = "2.0", features = ["legacy"] }
 rmp-serde = "1.1"
 hex = "0.4"
 colored = "2.1"
-csv = "1.3"

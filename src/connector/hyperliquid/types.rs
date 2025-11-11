@@ -283,61 +283,95 @@ pub struct UserFill {
     pub builder_fee: Option<String>, // Optional builder fee
 }
 
-/// User state response (positions and balances)
+/// User state from clearinghouseState endpoint
 #[derive(Debug, Clone, Deserialize)]
-pub struct UserStateResponse {
+pub struct UserState {
     #[serde(rename = "assetPositions")]
     pub asset_positions: Vec<AssetPosition>,
     #[serde(rename = "crossMarginSummary")]
     pub cross_margin_summary: CrossMarginSummary,
+    #[serde(rename = "marginSummary")]
+    pub margin_summary: MarginSummary,
+    #[serde(rename = "withdrawable")]
+    pub withdrawable: String,
+    pub time: u64,
 }
 
-/// Asset position
+/// Asset position wrapper
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssetPosition {
-    pub position: Position,
     #[serde(rename = "type")]
-    pub type_: String,
+    pub type_: String,  // "oneWay" for one-way mode
+    pub position: Position,
 }
 
-/// Position details
+/// Position data for a specific asset
 #[derive(Debug, Clone, Deserialize)]
 pub struct Position {
-    pub coin: String,
-    #[serde(rename = "szi")]
-    pub szi: String, // Signed position size (positive = long, negative = short)
-    pub leverage: Leverage,
+    pub coin: String,                 // Symbol (e.g., "SOL", "BTC")
+    pub szi: String,                  // Signed size (positive = long, negative = short)
     #[serde(rename = "entryPx")]
-    pub entry_px: Option<String>,
+    pub entry_px: Option<String>,     // Entry price
     #[serde(rename = "positionValue")]
-    pub position_value: String,
+    pub position_value: String,       // Position value in USD
     #[serde(rename = "unrealizedPnl")]
-    pub unrealized_pnl: String,
+    pub unrealized_pnl: String,       // Unrealized PnL
     #[serde(rename = "returnOnEquity")]
-    pub return_on_equity: String,
+    pub return_on_equity: String,     // ROE
     #[serde(rename = "liquidationPx")]
-    pub liquidation_px: Option<String>,
+    pub liquidation_px: Option<String>, // Liquidation price (if applicable)
+    pub leverage: Leverage,           // Leverage configuration
     #[serde(rename = "marginUsed")]
-    pub margin_used: String,
+    pub margin_used: String,          // Margin used for this position
+    #[serde(rename = "maxLeverage")]
+    pub max_leverage: u32,            // Max leverage allowed for this asset
+    #[serde(rename = "cumFunding")]
+    pub cum_funding: CumFunding,      // Cumulative funding
+}
+
+/// Cumulative funding data
+#[derive(Debug, Clone, Deserialize)]
+pub struct CumFunding {
+    #[serde(rename = "allTime")]
+    pub all_time: String,
+    #[serde(rename = "sinceOpen")]
+    pub since_open: String,
+    #[serde(rename = "sinceChange")]
+    pub since_change: String,
 }
 
 /// Leverage configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct Leverage {
     #[serde(rename = "type")]
-    pub type_: String,
-    pub value: u32,
+    pub type_: String,  // "cross" or "isolated"
+    pub value: u32,     // Leverage value (e.g., 1, 5, 20)
+    #[serde(rename = "rawUsd")]
+    pub raw_usd: Option<String>,  // Raw USD value (for isolated positions)
+}
+
+/// Margin summary
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarginSummary {
+    #[serde(rename = "accountValue")]
+    pub account_value: String,        // Total account value
+    #[serde(rename = "totalNtlPos")]
+    pub total_ntl_pos: String,        // Total notional position
+    #[serde(rename = "totalRawUsd")]
+    pub total_raw_usd: String,        // Total raw USD
+    #[serde(rename = "totalMarginUsed")]
+    pub total_margin_used: String,    // Total margin used
 }
 
 /// Cross margin summary
 #[derive(Debug, Clone, Deserialize)]
 pub struct CrossMarginSummary {
     #[serde(rename = "accountValue")]
-    pub account_value: String,
-    #[serde(rename = "totalMarginUsed")]
-    pub total_margin_used: String,
+    pub account_value: String,        // Account value
     #[serde(rename = "totalNtlPos")]
-    pub total_ntl_pos: String,
+    pub total_ntl_pos: String,        // Total notional position
     #[serde(rename = "totalRawUsd")]
-    pub total_raw_usd: String,
+    pub total_raw_usd: String,        // Total raw USD
+    #[serde(rename = "totalMarginUsed")]
+    pub total_margin_used: String,    // Total margin used
 }

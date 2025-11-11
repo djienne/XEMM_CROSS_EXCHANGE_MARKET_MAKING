@@ -84,7 +84,7 @@ pub fn calculate_hedge_profit(
 ///
 /// Returns: (fill_price, actual_fee)
 pub async fn fetch_pacifica_trade(
-    trading: Arc<Mutex<PacificaTrading>>,
+    trading: Arc<PacificaTrading>,
     symbol: &str,
     client_order_id: &str,
     max_attempts: u32,
@@ -105,8 +105,6 @@ pub async fn fetch_pacifica_trade(
         ));
 
         match trading
-            .lock()
-            .await
             .get_trade_history(Some(symbol), Some(20), None, None)
             .await
         {
