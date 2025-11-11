@@ -79,7 +79,7 @@ Edit `config.json`:
 
 ```json
 {
-  "symbol": "ENA",
+  "symbol": "SOL",
   "agg_level": 1,
   "reconnect_attempts": 5,
   "ping_interval_secs": 15,
@@ -184,7 +184,7 @@ The XEMM bot orchestrates 8 async tasks running in parallel:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `symbol` | "ENA" | Trading symbol (must exist on both exchanges) |
+| `symbol` | "SOL" | Trading symbol (must exist on both exchanges) |
 | `agg_level` | 1 | Orderbook aggregation level (1, 2, 5, 10, 100, 1000) |
 | `pacifica_maker_fee_bps` | 1.5 | Pacifica maker fee in basis points |
 | `hyperliquid_taker_fee_bps` | 4.0 | Hyperliquid taker fee in basis points |
@@ -405,11 +405,11 @@ The bot features colorized terminal output for easy monitoring:
 ### Example Output
 ```
 [INIT] ✓ Credentials loaded successfully
-[OPPORTUNITY] BUY @ $0.391200 → HL $0.392500 | Profit: 12.50 bps
-[ORDER] ✓ Placed BUY #12345 @ $0.3912 | cloid: abc123...xyz9
-[FILL_DETECTION] ✓ FULL FILL: buy 51.2048 ENA @ $0.3912
-[ENA HEDGE] Executing SELL 51.2048 on Hyperliquid
-[ENA HEDGE] ✓ Hedge executed successfully
+[OPPORTUNITY] BUY @ $156.12 → HL $156.35 | Profit: 12.50 bps
+[ORDER] ✓ Placed BUY #12345 @ $156.12 | cloid: abc123...xyz9
+[FILL_DETECTION] ✓ FULL FILL: buy 0.1281 SOL @ $156.12
+[SOL HEDGE] Executing SELL 0.1281 on Hyperliquid
+[SOL HEDGE] ✓ Hedge executed successfully
 ═══════════════════════════════════════════════════
   BOT CYCLE COMPLETE!
 ═══════════════════════════════════════════════════
