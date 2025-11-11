@@ -31,3 +31,7 @@ docker-compose.override.yml
 
 # Temporary files
 NUL
+
+# Documentation (except main README)
+*.md
+!README.md
