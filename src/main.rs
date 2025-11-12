@@ -1272,8 +1272,38 @@ async fn main() -> Result<()> {
                             format!("{:.4}", delta.abs()).green().bold()
                         );
 
-                        // Check if already processed
-                        let fill_id = format!("position_{}_{}", client_order_id, current_position.map(|p| p.updated_at).unwrap_or(0));
+                        // Check bot state - don't trigger duplicate hedges
+                        let current_state = {
+                            let state = bot_state_position.read().await;
+                            state.status.clone()
+                        };
+
+                        // Skip if already filled, hedging, or complete
+                        if matches!(
+                            current_state,
+                            xemm_rust::bot::BotStatus::Filled |
+                            xemm_rust::bot::BotStatus::Hedging |
+                            xemm_rust::bot::BotStatus::Complete
+                        ) {
+                            tprintln!(
+                                "{} {} Fill already handled by primary detection (state: {:?}), skipping duplicate hedge",
+                                "[POSITION_MONITOR]".bright_cyan().bold(),
+                                "ℹ".blue().bold(),
+                                current_state
+                            );
+
+                            // Update snapshot to prevent continuous detection
+                            let mut snapshot = last_position_snapshot_clone.lock().await;
+                            *snapshot = Some(PositionSnapshot {
+                                amount: current_amount,
+                                side: current_side,
+                                last_check: std::time::Instant::now(),
+                            });
+                            continue;
+                        }
+
+                        // Check if already processed - use consistent fill_id format with WebSocket detection
+                        let fill_id = format!("full_{}", client_order_id);
                         let mut processed = processed_fills_position.lock().await;
 
                         if !processed.contains(&fill_id) {
