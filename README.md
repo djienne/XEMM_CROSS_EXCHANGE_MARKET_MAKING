@@ -13,7 +13,7 @@ The diagram below illustrates the bot’s trading idea. We arbitrage the fact th
 Run on *AWS Tokyo* to have the best latency.
 
 <img src="schema.png" alt="XEMM Architecture Schema" width="700">
-
+Here, `profit_rate_bps` is actually a safety margin on top of a theoretically profitable maker-taker trade, to compensate for fees, slippage and latency.
 Inspired by Hummingbot's XEMM Strategy.
 
 **💰 Support this project**:
