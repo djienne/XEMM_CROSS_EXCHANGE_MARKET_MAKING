@@ -37,6 +37,10 @@ Thumbs.db
 *.key
 *.p12
 *.pfx
+*.zip
+*.tar.gz
+*.tar
+*.rar
 
 # Docker
 docker-compose.override.yml
