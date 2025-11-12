@@ -294,12 +294,6 @@ cargo run --example test_hl_l2_snapshot --release
 
 # Calculate opportunities without trading
 cargo run --example xemm_calculator --release
-
-# Advanced orderbook usage with statistics
-cargo run --example advanced_usage --release
-
-# Low-latency orderbook mode
-cargo run --example low_latency --release
 ```
 
 ### Fill Detection Testing
