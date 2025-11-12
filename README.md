@@ -5,7 +5,7 @@ The main rationale is to use Hyperliquid's better liquidity, namely lower spread
 
 ## Architecture Overview
 
-The diagram below illustrates the bot's trading idea:
+The diagram below illustrates the bot's trading idea. We arbitrage the fact that often bid-ask spread is tighter on Hyperliquid than in Pacifica because Hyperliquid has better liquidity.
 
 <img src="schema.png" alt="XEMM Architecture Schema" width="700">
 
