@@ -111,8 +111,29 @@ impl HedgeService {
 
             match hedge_result {
                 Ok(response) => {
+                    // Extract success data from response
+                    let response_data = match &response.response {
+                        crate::connector::hyperliquid::OrderResponseContent::Success(data) => data,
+                        crate::connector::hyperliquid::OrderResponseContent::Error(error) => {
+                            // This should not happen as trading.rs already handles errors,
+                            // but handle it defensively
+                            tprintln!("{} {} Hedge response contains error: {}",
+                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                "✗".red().bold(),
+                                error
+                            );
+
+                            let mut state = self.bot_state.write().await;
+                            state.set_error(format!("Hedge failed: {}", error));
+                            drop(state);
+
+                            self.shutdown_tx.send(()).await.ok();
+                            return;
+                        }
+                    };
+
                     // Validate and extract order status
-                    let hedge_fill_price = if let Some(status) = response.response.data.statuses.first() {
+                    let hedge_fill_price = if let Some(status) = response_data.data.statuses.first() {
                         match status {
                             crate::connector::hyperliquid::OrderStatus::Filled { filled } => {
                                 tprintln!("{} {} Hedge executed successfully: Filled {} @ ${}",
