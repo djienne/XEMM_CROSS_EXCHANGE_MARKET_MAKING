@@ -155,75 +155,41 @@ async fn main() -> Result<()> {
     });
     // ═══════════════════════════════════════════════════
     // Task 4: Pacifica REST API Polling (Complement WebSocket)
+    // Task 4: Pacifica REST API Polling (Complement WebSocket)
     // ═══════════════════════════════════════════════════
 
-    let pac_prices_rest_clone = pacifica_prices.clone();
-    // pacifica_trading_rest_poll already defined at top level (no clone needed)
-    let rest_symbol = config.symbol.clone();
-    let rest_agg_level = config.agg_level;
-    let rest_poll_interval = config.pacifica_rest_poll_interval_secs;
+    let pacifica_rest_poll_service = xemm_rust::services::rest_poll::PacificaRestPollService {
+        prices: pacifica_prices.clone(),
+        pacifica_trading: pacifica_trading_rest_poll.clone(),
+        symbol: config.symbol.clone(),
+        agg_level: config.agg_level,
+        poll_interval_secs: config.pacifica_rest_poll_interval_secs,
+    };
 
     tokio::spawn(async move {
-        let mut interval_timer = interval(Duration::from_secs(rest_poll_interval));
-        interval_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            interval_timer.tick().await;
-
-            match pacifica_trading_rest_poll.get_best_bid_ask_rest(&rest_symbol, rest_agg_level).await {
-                Ok(Some((bid, ask))) => {
-                    // Update shared orderbook prices
-                    *pac_prices_rest_clone.lock().unwrap() = (bid, ask);
-                    debug!(
-                        "[PACIFICA_REST] Updated prices via REST: bid=${:.4}, ask=${:.4}",
-                        bid, ask
-                    );
-                }
-                Ok(None) => {
-                    debug!("[PACIFICA_REST] No bid/ask available from REST API");
-                }
-                Err(e) => {
-                    debug!("[PACIFICA_REST] Failed to fetch prices: {}", e);
-                }
-            }
-        }
+        pacifica_rest_poll_service.run().await;
     });
 
     // ═══════════════════════════════════════════════════
     // Task 4.5: Hyperliquid REST API Polling (Complement WebSocket)
     // ═══════════════════════════════════════════════════
 
-    let hl_prices_rest_clone = hyperliquid_prices.clone();
-    let hyperliquid_trading_rest_clone = hyperliquid_trading.clone();
-    let hl_rest_symbol = config.symbol.clone();
-    let hl_rest_poll_interval = 2u64; // 2 seconds (same as Pacifica)
+    let hyperliquid_rest_poll_service = xemm_rust::services::rest_poll::HyperliquidRestPollService {
+        prices: hyperliquid_prices.clone(),
+        hyperliquid_trading: hyperliquid_trading.clone(),
+        symbol: config.symbol.clone(),
+        poll_interval_secs: 2, // 2 seconds (same as Pacifica default)
+    };
 
     tokio::spawn(async move {
-        let mut interval_timer = interval(Duration::from_secs(hl_rest_poll_interval));
-        interval_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            interval_timer.tick().await;
-
-            match hyperliquid_trading_rest_clone.get_l2_snapshot(&hl_rest_symbol).await {
-                Ok(Some((bid, ask))) => {
-                    // Update shared orderbook prices
-                    *hl_prices_rest_clone.lock().unwrap() = (bid, ask);
-                    debug!(
-                        "[HYPERLIQUID_REST] Updated prices via REST: bid=${:.4}, ask=${:.4}",
-                        bid, ask
-                    );
-                }
-                Ok(None) => {
-                    debug!("[HYPERLIQUID_REST] No bid/ask available from REST API");
-                }
-                Err(e) => {
-                    debug!("[HYPERLIQUID_REST] Failed to fetch prices: {}", e);
-                }
-            }
-        }
+        hyperliquid_rest_poll_service.run().await;
     });
 
+    // Wait for initial orderbook data
+    tprintln!("{} Waiting for orderbook data...", "[INIT]".cyan().bold());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // ═══════════════════════════════════════════════════
     // Wait for initial orderbook data
     tprintln!("{} Waiting for orderbook data...", "[INIT]".cyan().bold());
     tokio::time::sleep(Duration::from_secs(3)).await;
