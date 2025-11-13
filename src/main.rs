@@ -1,15 +1,13 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 use tokio::signal;
 
-use xemm_rust::bot::{ActiveOrder, BotState, BotStatus};
-use xemm_rust::config::Config;
+use xemm_rust::app::PositionSnapshot;
+use xemm_rust::bot::{ActiveOrder, BotStatus};
 use xemm_rust::trade_fetcher;
 
 // Macro for timestamped colored output
@@ -22,13 +20,13 @@ macro_rules! tprintln {
     }};
 }
 use xemm_rust::connector::hyperliquid::{
-    HyperliquidCredentials, HyperliquidTrading, OrderbookClient as HyperliquidOrderbookClient,
+    OrderbookClient as HyperliquidOrderbookClient,
     OrderbookConfig as HyperliquidOrderbookConfig,
 };
 use xemm_rust::connector::pacifica::{
-    FillDetectionClient, FillDetectionConfig, FillEvent, PositionBaselineUpdater,
+    FillDetectionClient, FillDetectionConfig, FillEvent,
     OrderbookClient as PacificaOrderbookClient, OrderbookConfig as PacificaOrderbookConfig, OrderSide as PacificaOrderSide,
-    PacificaCredentials, PacificaTrading, PacificaWsTrading,
+    PacificaTrading,
 };
 use xemm_rust::strategy::{Opportunity, OpportunityEvaluator, OrderSide};
 
@@ -131,111 +129,30 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    tprintln!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
-    tprintln!("{}", "  XEMM Bot - Cross-Exchange Market Making".bright_cyan().bold());
-    tprintln!("{}", "═══════════════════════════════════════════════════".bright_cyan().bold());
-    tprintln!("");
+    // Create and initialize bot (all wiring happens in XemmBot::new())
+    let bot = xemm_rust::app::XemmBot::new().await?;
 
-    // Load configuration
-    let config = Config::load_default().context("Failed to load config.json")?;
-    config.validate().context("Invalid configuration")?;
-
-    tprintln!("{} Symbol: {}", "[CONFIG]".blue().bold(), config.symbol.bright_white().bold());
-    tprintln!("{} Order Notional: {}", "[CONFIG]".blue().bold(), format!("${:.2}", config.order_notional_usd).bright_white());
-    tprintln!("{} Pacifica Maker Fee: {}", "[CONFIG]".blue().bold(), format!("{} bps", config.pacifica_maker_fee_bps).bright_white());
-    tprintln!("{} Hyperliquid Taker Fee: {}", "[CONFIG]".blue().bold(), format!("{} bps", config.hyperliquid_taker_fee_bps).bright_white());
-    tprintln!("{} Target Profit: {}", "[CONFIG]".blue().bold(), format!("{} bps", config.profit_rate_bps).green().bold());
-    tprintln!("{} Profit Cancel Threshold: {}", "[CONFIG]".blue().bold(), format!("{} bps", config.profit_cancel_threshold_bps).yellow());
-    tprintln!("{} Order Refresh Interval: {}", "[CONFIG]".blue().bold(), format!("{} secs", config.order_refresh_interval_secs).bright_white());
-    tprintln!("{} Pacifica REST Poll Interval: {}", "[CONFIG]".blue().bold(), format!("{} secs", config.pacifica_rest_poll_interval_secs).bright_white());
-    tprintln!("{} Hyperliquid Market Order maximum allowed Slippage: {}", "[CONFIG]".blue().bold(), format!("{}%", config.hyperliquid_slippage * 100.0).bright_white());
-    tprintln!("");
-
-    // Load credentials
-    dotenv::dotenv().ok();
-    let pacifica_credentials = PacificaCredentials::from_env()
-        .context("Failed to load Pacifica credentials from environment")?;
-    let hyperliquid_credentials = HyperliquidCredentials::from_env()
-        .context("Failed to load Hyperliquid credentials from environment")?;
-
-    tprintln!("{} {}", "[INIT]".cyan().bold(), "Credentials loaded successfully".green());
-
-    // Initialize trading clients
-    // Each task gets its own PacificaTrading instance to eliminate lock contention
-    // Wrapped in Arc for sharing across closures, but NO MUTEX = no blocking!
-    // This prevents tasks from blocking each other during HTTP calls
-    let pacifica_trading_main = Arc::new(PacificaTrading::new(pacifica_credentials.clone())
-        .context("Failed to create main Pacifica trading client")?);
-    let pacifica_trading_fill = Arc::new(PacificaTrading::new(pacifica_credentials.clone())
-        .context("Failed to create fill detection Pacifica trading client")?);
-    let pacifica_trading_rest_fill = Arc::new(PacificaTrading::new(pacifica_credentials.clone())
-        .context("Failed to create REST fill detection Pacifica trading client")?);
-    let pacifica_trading_monitor = Arc::new(PacificaTrading::new(pacifica_credentials.clone())
-        .context("Failed to create monitor Pacifica trading client")?);
-    let pacifica_trading_hedge = Arc::new(PacificaTrading::new(pacifica_credentials.clone())
-        .context("Failed to create hedge Pacifica trading client")?);
-    let pacifica_trading_rest_poll = Arc::new(PacificaTrading::new(pacifica_credentials.clone())
-        .context("Failed to create REST polling Pacifica trading client")?);
-
-
-    // Initialize WebSocket trading client for ultra-fast cancellations (no rate limits)
-    let pacifica_ws_trading = Arc::new(PacificaWsTrading::new(pacifica_credentials.clone(), false)); // false = mainnet
-
-    let hyperliquid_trading = Arc::new(HyperliquidTrading::new(hyperliquid_credentials, false)
-        .context("Failed to create Hyperliquid trading client")?);
-
-    tprintln!("{} {}", "[INIT]".cyan().bold(), "Trading clients initialized (6 REST instances + WebSocket)".green());
-
-    // Pre-fetch Hyperliquid metadata (szDecimals, etc.) to reduce hedge latency
-    tprintln!("{} Pre-fetching Hyperliquid metadata for {}...", "[INIT]".cyan().bold(), config.symbol.bright_white());
-    hyperliquid_trading.get_meta().await
-        .context("Failed to pre-fetch Hyperliquid metadata")?;
-    tprintln!("{} {} Hyperliquid metadata cached", "[INIT]".cyan().bold(), "✓".green().bold());
-
-    // Cancel any existing orders on Pacifica at startup
-    tprintln!("{} Cancelling any existing orders on Pacifica...", "[INIT]".cyan().bold());
-    match pacifica_trading_main.cancel_all_orders(false, Some(&config.symbol), false).await {
-        Ok(count) => tprintln!("{} {} Cancelled {} existing order(s)", "[INIT]".cyan().bold(), "✓".green().bold(), count),
-        Err(e) => tprintln!("{} {} Failed to cancel existing orders: {}", "[INIT]".cyan().bold(), "⚠".yellow().bold(), e),
-    }
-
-    // Get market info to determine tick size
-    let pacifica_tick_size: f64 = {
-        let market_info = pacifica_trading_main.get_market_info().await.context("Failed to fetch Pacifica market info")?;
-        let symbol_info = market_info
-            .get(&config.symbol)
-            .with_context(|| format!("Symbol {} not found in market info", config.symbol))?;
-        symbol_info
-            .tick_size
-            .parse()
-            .context("Failed to parse tick size")?
-    };
-
-    tprintln!("{} Pacifica tick size for {}: {}", "[INIT]".cyan().bold(), config.symbol.bright_white(), format!("{}", pacifica_tick_size).bright_white());
-
-    // Create opportunity evaluator
-    let evaluator = OpportunityEvaluator::new(
-        config.pacifica_maker_fee_bps,
-        config.hyperliquid_taker_fee_bps,
-        config.profit_rate_bps,
-        pacifica_tick_size,
-    );
-
-    tprintln!("{} {}", "[INIT]".cyan().bold(), "Opportunity evaluator created".green());
-
-    // Shared state for orderbook prices
-    let pacifica_prices = Arc::new(Mutex::new((0.0, 0.0))); // (bid, ask)
-    let hyperliquid_prices = Arc::new(Mutex::new((0.0, 0.0))); // (bid, ask)
-
-    // Shared bot state
-    let bot_state = Arc::new(RwLock::new(BotState::new()));
-
-    // Channels for communication
-    let (hedge_tx, mut hedge_rx) = mpsc::channel::<(OrderSide, f64, f64)>(1); // (side, size, avg_price)
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
-    tprintln!("{} {}", "[INIT]".cyan().bold(), "State and channels initialized".green());
-    tprintln!("");
+    // Get references to variables needed for the remaining code
+    let config = &bot.config;
+    let bot_state = bot.bot_state.clone();
+    let pacifica_prices = bot.pacifica_prices.clone();
+    let hyperliquid_prices = bot.hyperliquid_prices.clone();
+    let pacifica_trading_main = bot.pacifica_trading_main.clone();
+    let pacifica_trading_fill = bot.pacifica_trading_fill.clone();
+    let pacifica_trading_rest_fill = bot.pacifica_trading_rest_fill.clone();
+    let pacifica_trading_monitor = bot.pacifica_trading_monitor.clone();
+    let pacifica_trading_hedge = bot.pacifica_trading_hedge.clone();
+    let pacifica_trading_rest_poll = bot.pacifica_trading_rest_poll.clone();
+    let pacifica_ws_trading = bot.pacifica_ws_trading.clone();
+    let hyperliquid_trading = bot.hyperliquid_trading.clone();
+    let evaluator = bot.evaluator.clone();
+    let processed_fills = bot.processed_fills.clone();
+    let last_position_snapshot = bot.last_position_snapshot.clone();
+    let hedge_tx = bot.hedge_tx.clone();
+    let mut hedge_rx = bot.hedge_rx.unwrap();
+    let shutdown_tx = bot.shutdown_tx.clone();
+    let mut shutdown_rx = bot.shutdown_rx.unwrap();
+    let pacifica_credentials = bot.pacifica_credentials.clone();
 
     // ═══════════════════════════════════════════════════
     // Task 1: Pacifica Orderbook
@@ -290,21 +207,6 @@ async fn main() -> Result<()> {
             .await
             .ok();
     });
-
-    // Shared state for tracking processed fills (to prevent duplicate hedges from WS + REST + Position monitor)
-    let processed_fills = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<String>::new()));
-
-    // Track last known position for delta detection (4th fill detection method)
-    #[derive(Debug, Clone)]
-    struct PositionSnapshot {
-        amount: f64,
-        side: String,  // "bid" or "ask"
-        last_check: std::time::Instant,
-    }
-
-    let last_position_snapshot = Arc::new(tokio::sync::Mutex::new(
-        Option::<PositionSnapshot>::None
-    ));
 
     // ═══════════════════════════════════════════════════
     // Task 3: Fill Detection
