@@ -471,7 +471,15 @@ impl HyperliquidTrading {
             .context(format!("Failed to parse order response. Response text: {}",
                 &response_text.chars().take(300).collect::<String>()))?;
 
-        info!("[HYPERLIQUID] Order response: {:?}", order_response);
+        // Check if response indicates error
+        match &order_response.response {
+            crate::connector::hyperliquid::OrderResponseContent::Error(error_msg) => {
+                anyhow::bail!("Order rejected by exchange: {}", error_msg);
+            }
+            crate::connector::hyperliquid::OrderResponseContent::Success(_) => {
+                info!("[HYPERLIQUID] Order response: {:?}", order_response);
+            }
+        }
 
         Ok(order_response)
     }
