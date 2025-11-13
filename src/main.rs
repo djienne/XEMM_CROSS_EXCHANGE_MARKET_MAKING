@@ -274,257 +274,27 @@ async fn main() -> Result<()> {
     // Task 5.5: Position-Based Fill Detection (4th Layer - Ground Truth)
     // ═══════════════════════════════════════════════════
 
-    // (This will be extracted in Phase 3.3)
-
-    let bot_state_position = bot_state.clone();
-    let hedge_tx_position = hedge_tx.clone();
     let pacifica_trading_position = Arc::new(
         PacificaTrading::new(pacifica_credentials.clone())
             .context("Failed to create position monitor trading client")?
     );
-    let pacifica_ws_trading_position = pacifica_ws_trading.clone();
-    let symbol_position = config.symbol.clone();
-    let processed_fills_position = processed_fills.clone();
-    let last_position_snapshot_clone = last_position_snapshot.clone();
+
+    let position_monitor_service = xemm_rust::services::position_monitor::PositionMonitorService {
+        bot_state: bot_state.clone(),
+        hedge_tx: hedge_tx.clone(),
+        pacifica_trading: pacifica_trading_position,
+        pacifica_ws_trading: pacifica_ws_trading.clone(),
+        symbol: config.symbol.clone(),
+        processed_fills: processed_fills.clone(),
+        last_position_snapshot: last_position_snapshot.clone(),
+    };
 
     tokio::spawn(async move {
-        let mut poll_interval = interval(Duration::from_millis(500)); // 500ms polling
-        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            poll_interval.tick().await;
-
-            // Only check if we have an active order
-            let active_order_info = {
-                let state = bot_state_position.read().await;
-                if matches!(
-                    state.status,
-                    xemm_rust::bot::BotStatus::Complete | xemm_rust::bot::BotStatus::Error(_)
-                ) {
-                    continue;
-                }
-
-                state.active_order.as_ref().map(|o| (
-                    o.client_order_id.clone(),
-                    o.side,
-                    o.size
-                ))
-            };
-
-            if active_order_info.is_none() {
-                // No active order - update snapshot for next order
-                match pacifica_trading_position.get_positions().await {
-                    Ok(positions) => {
-                        let position = positions.iter().find(|p| p.symbol == symbol_position);
-                        let mut snapshot = last_position_snapshot_clone.lock().await;
-
-                        if let Some(pos) = position {
-                            let amount: f64 = pos.amount.parse().unwrap_or(0.0);
-                            *snapshot = Some(PositionSnapshot {
-                                amount,
-                                side: pos.side.clone(),
-                                last_check: std::time::Instant::now(),
-                            });
-                            debug!("[POSITION_MONITOR] Updated baseline: {} {} {}",
-                                symbol_position, pos.side, amount);
-                        } else {
-                            *snapshot = None;
-                            debug!("[POSITION_MONITOR] No position for {}", symbol_position);
-                        }
-                    }
-                    Err(e) => {
-                        debug!("[POSITION_MONITOR] Failed to fetch baseline position: {}", e);
-                    }
-                }
-                continue;
-            }
-
-            let (client_order_id, order_side, order_size) = active_order_info.unwrap();
-
-            // Fetch current positions
-            let positions_result = pacifica_trading_position.get_positions().await;
-
-            match positions_result {
-                Ok(positions) => {
-                    let current_position = positions.iter().find(|p| p.symbol == symbol_position);
-                    let last_snapshot = last_position_snapshot_clone.lock().await.clone();
-
-                    // Calculate position delta
-                    let (last_amount, last_side) = if let Some(ref snap) = last_snapshot {
-                        (snap.amount, snap.side.clone())
-                    } else {
-                        (0.0, "none".to_string())
-                    };
-
-                    let (current_amount, current_side) = if let Some(pos) = current_position {
-                        (pos.amount.parse::<f64>().unwrap_or(0.0), pos.side.clone())
-                    } else {
-                        (0.0, "none".to_string())
-                    };
-
-                    // Convert to signed position for delta calculation
-                    let last_signed = match last_side.as_str() {
-                        "bid" => last_amount,
-                        "ask" => -last_amount,
-                        _ => 0.0,
-                    };
-
-                    let current_signed = match current_side.as_str() {
-                        "bid" => current_amount,
-                        "ask" => -current_amount,
-                        _ => 0.0,
-                    };
-
-                    let delta = current_signed - last_signed;
-
-                    // Check if delta matches our order direction
-                    let delta_matches_order = (delta > 0.0 && matches!(order_side, OrderSide::Buy))
-                        || (delta < 0.0 && matches!(order_side, OrderSide::Sell));
-
-                    // If delta is significant and matches order direction
-                    if delta.abs() > 0.0001 && delta_matches_order {
-                        // Position changed in expected direction - fill detected!
-                        let fill_size = delta.abs();
-
-                        tprintln!(
-                            "{} {} Position delta detected: {} {} → {} {} (Δ {:.4})",
-                            "[POSITION_MONITOR]".bright_cyan().bold(),
-                            "⚡".yellow().bold(),
-                            format!("{:.4}", last_signed).bright_white(),
-                            last_side.yellow(),
-                            format!("{:.4}", current_signed).bright_white(),
-                            current_side.yellow(),
-                            format!("{:.4}", delta.abs()).green().bold()
-                        );
-
-                        // Check bot state - don't trigger duplicate hedges
-                        let current_state = {
-                            let state = bot_state_position.read().await;
-                            state.status.clone()
-                        };
-
-                        // Skip if already filled, hedging, or complete
-                        if matches!(
-                            current_state,
-                            xemm_rust::bot::BotStatus::Filled |
-                            xemm_rust::bot::BotStatus::Hedging |
-                            xemm_rust::bot::BotStatus::Complete
-                        ) {
-                            tprintln!(
-                                "{} {} Fill already handled by primary detection (state: {:?}), skipping duplicate hedge",
-                                "[POSITION_MONITOR]".bright_cyan().bold(),
-                                "ℹ".blue().bold(),
-                                current_state
-                            );
-
-                            // Update snapshot to prevent continuous detection
-                            let mut snapshot = last_position_snapshot_clone.lock().await;
-                            *snapshot = Some(PositionSnapshot {
-                                amount: current_amount,
-                                side: current_side,
-                                last_check: std::time::Instant::now(),
-                            });
-                            continue;
-                        }
-
-                        // Check if already processed - use consistent fill_id format with WebSocket detection
-                        let fill_id = format!("full_{}", client_order_id);
-                        let mut processed = processed_fills_position.lock().await;
-
-                        if !processed.contains(&fill_id) {
-                            processed.insert(fill_id.clone());
-                            drop(processed);
-
-                            tprintln!(
-                                "{} {} FILL DETECTED via position change!",
-                                "[POSITION_MONITOR]".bright_cyan().bold(),
-                                "✓".green().bold()
-                            );
-
-                            // Update state to Filled
-                            {
-                                let mut state = bot_state_position.write().await;
-                                state.mark_filled(fill_size, order_side);
-                            }
-
-                            // Dual cancellation
-                            tprintln!("{} {} Dual cancellation (REST + WebSocket)...",
-                                "[POSITION_MONITOR]".bright_cyan().bold(),
-                                "⚡".yellow().bold()
-                            );
-
-                            let rest_result = pacifica_trading_position
-                                .cancel_all_orders(false, Some(&symbol_position), false)
-                                .await;
-
-                            match rest_result {
-                                Ok(count) => {
-                                    tprintln!("{} {} REST API cancelled {} order(s)",
-                                        "[POSITION_MONITOR]".bright_cyan().bold(),
-                                        "✓".green().bold(),
-                                        count
-                                    );
-                                }
-                                Err(e) => {
-                                    tprintln!("{} {} REST API cancel failed: {}",
-                                        "[POSITION_MONITOR]".bright_cyan().bold(),
-                                        "⚠".yellow().bold(),
-                                        e
-                                    );
-                                }
-                            }
-
-                            let ws_result = pacifica_ws_trading_position
-                                .cancel_all_orders_ws(false, Some(&symbol_position), false)
-                                .await;
-
-                            match ws_result {
-                                Ok(count) => {
-                                    tprintln!("{} {} WebSocket cancelled {} order(s)",
-                                        "[POSITION_MONITOR]".bright_cyan().bold(),
-                                        "✓".green().bold(),
-                                        count
-                                    );
-                                }
-                                Err(e) => {
-                                    tprintln!("{} {} WebSocket cancel failed: {}",
-                                        "[POSITION_MONITOR]".bright_cyan().bold(),
-                                        "⚠".yellow().bold(),
-                                        e
-                                    );
-                                }
-                            }
-
-                            // Estimate fill price (use current entry price or mid)
-                            let estimated_price = current_position
-                                .and_then(|p| p.entry_price.parse::<f64>().ok())
-                                .unwrap_or(0.0);
-
-                            tprintln!("{} Triggering hedge for position-detected fill",
-                                "[POSITION_MONITOR]".bright_cyan().bold()
-                            );
-
-                            // Trigger hedge
-                            hedge_tx_position.send((order_side, fill_size, estimated_price)).await.ok();
-                        } else {
-                            debug!("[POSITION_MONITOR] Fill already processed by another detection method");
-                        }
-
-                        // Update snapshot
-                        let mut snapshot = last_position_snapshot_clone.lock().await;
-                        *snapshot = Some(PositionSnapshot {
-                            amount: current_amount,
-                            side: current_side,
-                            last_check: std::time::Instant::now(),
-                        });
-                    }
-                }
-                Err(e) => {
-                    debug!("[POSITION_MONITOR] Failed to fetch positions: {}", e);
-                }
-            }
-        }
+        position_monitor_service.run().await;
     });
+
+    // Small delay to let position monitor initialize
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // ═══════════════════════════════════════════════════
     // Task 6: Order Monitoring (Profit Check & Refresh)
