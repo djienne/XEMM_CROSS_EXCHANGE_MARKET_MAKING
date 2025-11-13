@@ -229,8 +229,8 @@ pub struct OrderResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderResponseData {
-    #[serde(rename = "type")]
-    pub type_: String,
+    #[serde(rename = "type", default)]
+    pub type_: Option<String>,
     pub data: OrderStatusData,
 }
 
