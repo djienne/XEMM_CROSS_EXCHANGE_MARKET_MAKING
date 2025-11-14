@@ -4,9 +4,8 @@
 /// both exchanges after a hedge execution. This is used by the main bot
 /// for profit calculation and can be tested independently.
 
-use std::time::Duration;
-use tokio::sync::Mutex;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::connector::pacifica::trading::{PacificaTrading, TradeHistoryItem};
 use crate::connector::hyperliquid::trading::HyperliquidTrading;
@@ -114,7 +113,7 @@ pub async fn fetch_pacifica_trade(
                 let matching_trades: Vec<_> = trades
                     .iter()
                     .filter(|t| {
-                        &t.client_order_id == client_order_id &&
+                        t.client_order_id.as_deref() == Some(client_order_id) &&
                         t.event_type == "fulfill_maker"
                     })
                     .collect();

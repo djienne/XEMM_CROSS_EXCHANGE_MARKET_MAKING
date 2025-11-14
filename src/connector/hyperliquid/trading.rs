@@ -458,12 +458,28 @@ impl HyperliquidTrading {
             anyhow::bail!("Order failed: {}", error_text);
         }
 
-        let order_response: OrderResponse = response
-            .json()
+        // Get response text for debugging
+        let response_text = response
+            .text()
             .await
-            .context("Failed to parse order response")?;
+            .context("Failed to read response text")?;
 
-        info!("[HYPERLIQUID] Order response: {:?}", order_response);
+        debug!("[HYPERLIQUID] Order response (first 500 chars): {}",
+            &response_text.chars().take(500).collect::<String>());
+
+        let order_response: OrderResponse = serde_json::from_str(&response_text)
+            .context(format!("Failed to parse order response. Response text: {}",
+                &response_text.chars().take(300).collect::<String>()))?;
+
+        // Check if response indicates error
+        match &order_response.response {
+            crate::connector::hyperliquid::OrderResponseContent::Error(error_msg) => {
+                anyhow::bail!("Order rejected by exchange: {}", error_msg);
+            }
+            crate::connector::hyperliquid::OrderResponseContent::Success(_) => {
+                info!("[HYPERLIQUID] Order response: {:?}", order_response);
+            }
+        }
 
         Ok(order_response)
     }

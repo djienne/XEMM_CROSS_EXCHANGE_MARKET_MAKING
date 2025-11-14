@@ -4,4 +4,4 @@ pub mod trading;
 
 pub use client::{OrderbookClient, OrderbookConfig};
 pub use trading::{HyperliquidTrading, HyperliquidCredentials};
-pub use types::{L2BookData, BookLevel, TopOfBook, OrderResponse, OrderStatus, UserFill, UserState, AssetPosition, Position, Leverage, CumFunding, MarginSummary, CrossMarginSummary};
+pub use types::{L2BookData, BookLevel, TopOfBook, OrderResponse, OrderResponseContent, OrderStatus, UserFill, UserState, AssetPosition, Position, Leverage, CumFunding, MarginSummary, CrossMarginSummary};
