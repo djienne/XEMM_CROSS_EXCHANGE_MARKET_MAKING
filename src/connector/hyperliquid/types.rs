@@ -224,13 +224,21 @@ pub struct MetaResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderResponse {
     pub status: String,
-    pub response: OrderResponseData,
+    pub response: OrderResponseContent,
+}
+
+/// Response content can be either success (object) or error (string)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OrderResponseContent {
+    Success(OrderResponseData),
+    Error(String),
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderResponseData {
-    #[serde(rename = "type")]
-    pub type_: String,
+    #[serde(rename = "type", default)]
+    pub type_: Option<String>,
     pub data: OrderStatusData,
 }
 
