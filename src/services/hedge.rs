@@ -88,7 +88,77 @@ impl HedgeService {
                 OrderSide::Sell => true, // Filled sell on Pacifica → buy on Hyperliquid
             };
 
-            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock().unwrap();
+            let (mut hl_bid, mut hl_ask) = *self.hyperliquid_prices.lock().unwrap();
+
+            if hl_bid <= 0.0 || hl_ask <= 0.0 {
+                tprintln!("{} {} Hyperliquid price cache empty - fetching fresh snapshot before hedging",
+                    format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                    "⚠".yellow().bold()
+                );
+
+                const MAX_ATTEMPTS: usize = 5;
+                for attempt in 1..=MAX_ATTEMPTS {
+                    match self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol).await {
+                        Ok(Some((bid, ask))) if bid > 0.0 && ask > 0.0 => {
+                            hl_bid = bid;
+                            hl_ask = ask;
+                            let mut cache = self.hyperliquid_prices.lock().unwrap();
+                            *cache = (bid, ask);
+                            tprintln!("{} {} Refreshed Hyperliquid prices: bid ${:.4}, ask ${:.4}",
+                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                "✓".green().bold(),
+                                hl_bid,
+                                hl_ask
+                            );
+                            break;
+                        }
+                        Ok(_) => {
+                            tprintln!("{} {} Snapshot missing bid/ask data (attempt {}/{})",
+                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                "⚠".yellow().bold(),
+                                attempt,
+                                MAX_ATTEMPTS
+                            );
+                        }
+                        Err(err) => {
+                            tprintln!("{} {} Failed to fetch Hyperliquid snapshot (attempt {}/{}): {}",
+                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                "⚠".yellow().bold(),
+                                attempt,
+                                MAX_ATTEMPTS,
+                                err
+                            );
+                        }
+                    }
+
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let cached = *self.hyperliquid_prices.lock().unwrap();
+                        hl_bid = cached.0;
+                        hl_ask = cached.1;
+                        if hl_bid > 0.0 && hl_ask > 0.0 {
+                            tprintln!("{} {} Hyperliquid prices populated by feed during wait",
+                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                "✓".green().bold()
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                if hl_bid <= 0.0 || hl_ask <= 0.0 {
+                    tprintln!("{} {} Unable to obtain Hyperliquid prices - aborting hedge for safety",
+                        format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                        "✗".red().bold()
+                    );
+
+                    let mut state = self.bot_state.write().await;
+                    state.set_error("Hyperliquid prices unavailable for hedge".to_string());
+
+                    self.shutdown_tx.send(()).await.ok();
+                    return;
+                }
+            }
 
             tprintln!(
                 "{} Executing {} {} on Hyperliquid",
