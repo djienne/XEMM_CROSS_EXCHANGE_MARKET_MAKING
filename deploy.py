@@ -49,15 +49,16 @@ REMOTE_USER = "ubuntu"
 REMOTE_HOST = "54.95.246.213"
 REMOTE_PATH = "/home/ubuntu/XEMM_rust"
 LOCAL_PATH = "."
+SSH_KEY_NAME = "lighter.pem"  # SSH key filename
 
 # Find SSH key in multiple locations (cross-platform: Windows + WSL)
 def find_ssh_key():
     """Find SSH key in Windows or WSL filesystem."""
     possible_paths = [
-        os.path.expanduser("~/lighter.pem"),  # WSL/Linux home directory
-        "./lighter.pem",  # Current directory (Windows native)
-        os.path.join(os.getcwd(), "lighter.pem"),  # Absolute current dir
-        "lighter.pem",  # Relative path
+        os.path.expanduser(f"~/{SSH_KEY_NAME}"),  # WSL/Linux home directory
+        f"./{SSH_KEY_NAME}",  # Current directory (Windows native)
+        os.path.join(os.getcwd(), SSH_KEY_NAME),  # Absolute current dir
+        SSH_KEY_NAME,  # Relative path
     ]
 
     for path in possible_paths:
@@ -134,11 +135,11 @@ def print_info(text):
 def check_ssh_key():
     """Check if SSH key exists and set proper permissions."""
     if SSH_KEY is None:
-        print_error("SSH key 'lighter.pem' not found in any expected location")
+        print_error(f"SSH key '{SSH_KEY_NAME}' not found in any expected location")
         print("Searched locations:")
-        print("  - ~/lighter.pem (WSL/Linux home)")
-        print("  - ./lighter.pem (current directory)")
-        print("Please ensure lighter.pem is in one of these locations")
+        print(f"  - ~/{SSH_KEY_NAME} (WSL/Linux home)")
+        print(f"  - ./{SSH_KEY_NAME} (current directory)")
+        print(f"Please ensure {SSH_KEY_NAME} is in one of these locations")
         return False
 
     ssh_key_path = Path(SSH_KEY)

@@ -26,15 +26,16 @@ REMOTE_USER = "ubuntu"
 REMOTE_HOST = "54.95.246.213"
 REMOTE_PATH = "/home/ubuntu/XEMM_rust"
 LOCAL_DOWNLOAD_DIR = "downloaded_trades"
+SSH_KEY_NAME = "lighter.pem"  # SSH key filename
 
 
 def find_ssh_key():
     """Find SSH key in Windows or WSL filesystem."""
     possible_paths = [
-        os.path.expanduser("~/lighter.pem"),  # WSL/Linux home directory
-        "./lighter.pem",  # Current directory (Windows native)
-        os.path.join(os.getcwd(), "lighter.pem"),  # Absolute current dir
-        "lighter.pem",  # Relative path
+        os.path.expanduser(f"~/{SSH_KEY_NAME}"),  # WSL/Linux home directory
+        f"./{SSH_KEY_NAME}",  # Current directory (Windows native)
+        os.path.join(os.getcwd(), SSH_KEY_NAME),  # Absolute current dir
+        SSH_KEY_NAME,  # Relative path
     ]
 
     for path in possible_paths:
@@ -72,10 +73,10 @@ def print_info(text):
 def check_ssh_key():
     """Check if SSH key exists."""
     if SSH_KEY is None:
-        print_error("SSH key 'lighter.pem' not found in any expected location")
+        print_error(f"SSH key '{SSH_KEY_NAME}' not found in any expected location")
         print("Searched locations:")
-        print("  - ~/lighter.pem (WSL/Linux home)")
-        print("  - ./lighter.pem (current directory)")
+        print(f"  - ~/{SSH_KEY_NAME} (WSL/Linux home)")
+        print(f"  - ./{SSH_KEY_NAME} (current directory)")
         return False
 
     print_success(f"Found SSH key: {SSH_KEY}")
