@@ -201,14 +201,14 @@ impl FillDetectionService {
                                 );
 
                                 // Trigger hedge immediately (runs in parallel with background cancellation)
-                        // FIX: Use async send for bounded channel
-                        if let Err(e) = hedge_tx.send((order_side, filled_size, avg_px, fill_detect_start)).await {
-                            tprintln!("{} {} Failed to send hedge event: {}",
-                                format!("[{}]", symbol_clone).bright_white().bold(),
-                                "✗".red().bold(),
-                                e
-                            );
-                        }
+                                // FIX: Use async send for bounded channel
+                                if let Err(e) = hedge_tx.send((order_side, filled_size, avg_px, fill_detect_start)).await {
+                                    tprintln!("{} {} Failed to send hedge event: {}",
+                                        format!("[{}]", symbol_clone).bright_white().bold(),
+                                        "✗".red().bold(),
+                                        e
+                                    );
+                                }
                             }
                         });
                     }

@@ -118,6 +118,17 @@ impl OrderMonitorService {
                     "Refreshing".yellow()
                 );
 
+                // Set cancellation flag BEFORE making REST call (prevents race with fill detection)
+                {
+                    let mut state = self.bot_state.write().await;
+                    if state.status != BotStatus::OrderPlaced {
+                        // Status changed (likely filled) - abort cancellation
+                        continue;
+                    }
+                    state.mark_cancellation_starting();
+                    drop(state);
+                }
+
                 // Cancel all orders for this symbol (only if no fills detected above)
                 let cancel_result = self.pacifica_trading
                     .cancel_all_orders(false, Some(&active_order.symbol), false)
@@ -145,10 +156,14 @@ impl OrderMonitorService {
                             tprintln!("{} {} Failed to cancel order: {}", "[MONITOR]".yellow().bold(), "✗".red().bold(), e);
                         }
 
+                        // Clear cancellation flag on error
+                        let mut state = self.bot_state.write().await;
+                        state.mark_cancellation_complete();
+
                         // Check if order is still active (might have been filled/cancelled)
-                        let state = self.bot_state.read().await;
                         if state.active_order.is_none() {
                             // Order already cleared by fill detection or another task
+                            drop(state);
                             continue;
                         }
                         drop(state);
@@ -158,6 +173,7 @@ impl OrderMonitorService {
 
                 // Clear active order ONLY if not filled/hedging
                 let mut state = self.bot_state.write().await;
+                state.mark_cancellation_complete(); // Clear flag
                 match &state.status {
                     BotStatus::OrderPlaced => {
                         // Normal cancellation - safe to clear
@@ -296,6 +312,17 @@ impl OrderMonitorService {
                     "Cancelling".yellow()
                 );
 
+                // Set cancellation flag BEFORE making REST call (prevents race with fill detection)
+                {
+                    let mut state = self.bot_state.write().await;
+                    if state.status != BotStatus::OrderPlaced {
+                        // Status changed (likely filled) - abort cancellation
+                        continue;
+                    }
+                    state.mark_cancellation_starting();
+                    drop(state);
+                }
+
                 // Cancel all orders for this symbol (only if no fills detected above)
                 let cancel_result = self.pacifica_trading
                     .cancel_all_orders(false, Some(&active_order.symbol), false)
@@ -336,6 +363,7 @@ impl OrderMonitorService {
 
                 // Clear active order ONLY if not filled/hedging
                 let mut state = self.bot_state.write().await;
+                state.mark_cancellation_complete(); // Clear flag
                 match &state.status {
                     BotStatus::OrderPlaced => {
                         // Normal cancellation - safe to clear

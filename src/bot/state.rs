@@ -48,6 +48,8 @@ pub struct BotState {
     pub status: BotStatus,
     /// Last time an order was cancelled (for grace period enforcement)
     pub last_cancellation_time: Option<Instant>,
+    /// Flag indicating order cancellation is in progress (prevents race conditions)
+    pub cancellation_in_progress: bool,
 }
 
 impl BotState {
@@ -58,6 +60,7 @@ impl BotState {
             position: 0.0,
             status: BotStatus::Idle,
             last_cancellation_time: None,
+            cancellation_in_progress: false,
         }
     }
 
@@ -118,6 +121,21 @@ impl BotState {
             None => true, // No previous cancellation
             Some(last_cancel) => last_cancel.elapsed().as_secs() >= grace_period_secs,
         }
+    }
+
+    /// Mark cancellation as in progress
+    pub fn mark_cancellation_starting(&mut self) {
+        self.cancellation_in_progress = true;
+    }
+
+    /// Clear cancellation flag
+    pub fn mark_cancellation_complete(&mut self) {
+        self.cancellation_in_progress = false;
+    }
+
+    /// Check if cancellation is in progress
+    pub fn is_cancellation_in_progress(&self) -> bool {
+        self.cancellation_in_progress
     }
 }
 

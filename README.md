@@ -81,8 +81,8 @@ All methods deduplicate via shared HashSet to ensure only one hedge executes per
 This development branch introduces a low-latency, queue-based hedge pipeline and WebSocket-based Hyperliquid execution:
 
 - **Hedge event queue (non-blocking)**  
-  - All fill-detection layers (`FillDetectionService`, `RestFillDetectionService`, `PositionMonitorService`) act as **producers** and push `HedgeEvent`s into an unbounded Tokio `mpsc` channel.  
-  - Producers never block when enqueuing, so fill detection is not slowed down by hedge execution.
+  - All fill-detection layers (`FillDetectionService`, `RestFillDetectionService`, `PositionMonitorService`) act as **producers** and push `HedgeEvent`s into a **bounded** Tokio `mpsc` channel (capacity 1024).
+  - Producers use async `send().await` to handle backpressure, ensuring memory safety under high load.
 
 - **Dedicated hedge executor task**  
   - `HedgeService` runs in its own async task and acts as a **single consumer** of the hedge event queue.  
