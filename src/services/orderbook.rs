@@ -25,11 +25,13 @@ pub struct PacificaOrderbookService {
     pub agg_level: u32,
     pub reconnect_attempts: u32,
     pub ping_interval_secs: u64,
+    pub price_update_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl PacificaOrderbookService {
     pub async fn run(self) -> Result<()> {
         let pac_prices_clone = self.prices.clone();
+        let price_update_tx_clone = self.price_update_tx.clone();
         let pacifica_ob_config = PacificaOrderbookConfig {
             symbol: self.symbol.clone(),
             agg_level: self.agg_level,
@@ -42,10 +44,18 @@ impl PacificaOrderbookService {
 
         tprintln!("{} Starting orderbook client", "[PACIFICA_OB]".magenta().bold());
         pacifica_ob_client
-            .start(move |bid, ask, _symbol, _ts| {
-                let bid_price: f64 = bid.parse().unwrap_or(0.0);
-                let ask_price: f64 = ask.parse().unwrap_or(0.0);
-                *pac_prices_clone.lock().unwrap() = (bid_price, ask_price);
+            .start(move |book_data| {
+                // Extract top of book using zero-copy accessor (optimized for latency)
+                // Note: book_data contains full depth which can be used for VWAP later
+                if let Some((bid_str, ask_str)) = book_data.get_best_bid_ask() {
+                    // Parse strings directly without intermediate allocations
+                    let bid_price: f64 = bid_str.parse().unwrap_or(0.0);
+                    let ask_price: f64 = ask_str.parse().unwrap_or(0.0);
+                    *pac_prices_clone.lock().unwrap() = (bid_price, ask_price);
+                    
+                    // Notify subscribers of price update (triggers opportunity evaluation + order monitoring)
+                    let _ = price_update_tx_clone.send(());
+                }
             })
             .await
             .ok();
@@ -64,11 +74,13 @@ pub struct HyperliquidOrderbookService {
     pub reconnect_attempts: u32,
     pub ping_interval_secs: u64,
     pub request_interval_ms: u64,
+    pub price_update_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl HyperliquidOrderbookService {
     pub async fn run(self) -> Result<()> {
         let hl_prices_clone = self.prices.clone();
+        let price_update_tx_clone = self.price_update_tx.clone();
         let hyperliquid_ob_config = HyperliquidOrderbookConfig {
             coin: self.symbol.clone(),
             reconnect_attempts: self.reconnect_attempts,
@@ -81,10 +93,17 @@ impl HyperliquidOrderbookService {
 
         tprintln!("{} Starting orderbook client", "[HYPERLIQUID_OB]".magenta().bold());
         hyperliquid_ob_client
-            .start(move |bid, ask, _coin, _ts| {
-                let bid_price: f64 = bid.parse().unwrap_or(0.0);
-                let ask_price: f64 = ask.parse().unwrap_or(0.0);
-                *hl_prices_clone.lock().unwrap() = (bid_price, ask_price);
+            .start(move |book_data| {
+                // Extract top of book using zero-copy accessor (optimized for latency)
+                if let Some((bid_str, ask_str)) = book_data.get_best_bid_ask() {
+                    // Parse strings directly without intermediate allocations
+                    let bid_price: f64 = bid_str.parse().unwrap_or(0.0);
+                    let ask_price: f64 = ask_str.parse().unwrap_or(0.0);
+                    *hl_prices_clone.lock().unwrap() = (bid_price, ask_price);
+                    
+                    // Notify subscribers of price update (triggers opportunity evaluation + order monitoring)
+                    let _ = price_update_tx_clone.send(());
+                }
             })
             .await
             .ok();

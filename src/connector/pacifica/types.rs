@@ -97,6 +97,21 @@ impl OrderbookData {
             timestamp: self.timestamp,
         }
     }
+
+    /// Extract best bid and ask prices as string references (zero-copy, optimized for latency)
+    ///
+    /// Returns (bid_price, ask_price) if both are available, None otherwise
+    pub fn get_best_bid_ask(&self) -> Option<(&str, &str)> {
+        let bid_price = self.levels.get(0)
+            .and_then(|bids| bids.first())
+            .map(|level| level.price.as_str())?;
+
+        let ask_price = self.levels.get(1)
+            .and_then(|asks| asks.first())
+            .map(|level| level.price.as_str())?;
+
+        Some((bid_price, ask_price))
+    }
 }
 
 impl SubscribeMessage {

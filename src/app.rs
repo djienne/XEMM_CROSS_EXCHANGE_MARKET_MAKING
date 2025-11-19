@@ -19,6 +19,7 @@ use crate::connector::pacifica::{
 use crate::services::{
     fill_detection::FillDetectionService, hedge::HedgeService, order_monitor::OrderMonitorService,
     orderbook::{HyperliquidOrderbookService, PacificaOrderbookService},
+    order_placement::{OrderPlacementRequest, OrderPlacementService},
     position_monitor::PositionMonitorService, rest_fill_detection::RestFillDetectionService,
     rest_poll::{HyperliquidRestPollService, PacificaRestPollService}, HedgeEvent,
 };
@@ -74,6 +75,10 @@ pub struct XemmBot {
     pub hedge_rx: Option<mpsc::Receiver<HedgeEvent>>,
     pub shutdown_tx: mpsc::Sender<()>,
     pub shutdown_rx: Option<mpsc::Receiver<()>>,
+    pub price_update_tx: tokio::sync::broadcast::Sender<()>,
+    pub price_update_rx: Option<tokio::sync::broadcast::Receiver<()>>,
+    pub order_tx: mpsc::Sender<OrderPlacementRequest>,
+    pub order_rx: Option<mpsc::Receiver<OrderPlacementRequest>>,
 
     // Credentials (needed for spawning services)
     pub pacifica_credentials: PacificaCredentials,
@@ -385,6 +390,10 @@ impl XemmBot {
         // FIX: Use bounded channel to prevent memory exhaustion (backpressure)
         let (hedge_tx, hedge_rx) = mpsc::channel::<HedgeEvent>(1024);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        // Price update notification channel (broadcast for multiple subscribers: main loop + order monitor)
+        let (price_update_tx, price_update_rx) = tokio::sync::broadcast::channel::<()>(1000);
+        // Order placement queue (bounded to prevent memory exhaustion)
+        let (order_tx, order_rx) = mpsc::channel::<OrderPlacementRequest>(32);
 
         // Fill tracking state
         let processed_fills = Arc::new(tokio::sync::Mutex::new(HashSet::<String>::new()));
@@ -421,6 +430,10 @@ impl XemmBot {
             hedge_rx: Some(hedge_rx),
             shutdown_tx,
             shutdown_rx: Some(shutdown_rx),
+            price_update_tx,
+            price_update_rx: Some(price_update_rx),
+            order_tx,
+            order_rx: Some(order_rx),
             pacifica_credentials,
         })
     }
@@ -438,6 +451,7 @@ impl XemmBot {
             agg_level: self.config.agg_level,
             reconnect_attempts: self.config.reconnect_attempts,
             ping_interval_secs: self.config.ping_interval_secs,
+            price_update_tx: self.price_update_tx.clone(),
         };
         tokio::spawn(async move {
             pacifica_ob_service.run().await.ok();
@@ -450,6 +464,7 @@ impl XemmBot {
             reconnect_attempts: self.config.reconnect_attempts,
             ping_interval_secs: self.config.ping_interval_secs,
             request_interval_ms: 99, // ~10 Hz updates
+            price_update_tx: self.price_update_tx.clone(),
         };
         tokio::spawn(async move {
             hyperliquid_ob_service.run().await.ok();
@@ -541,7 +556,19 @@ impl XemmBot {
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Service 6: Order Monitor (age/profit monitoring)
+        // Service 6.5: Order Placement (async, non-blocking)
+        let order_placement_service = OrderPlacementService {
+            bot_state: self.bot_state.clone(),
+            pacifica_trading: self.pacifica_trading_main.clone(),
+            config: self.config.clone(),
+            order_rx: self.order_rx.take().unwrap(),
+        };
+        tokio::spawn(async move {
+            order_placement_service.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Service 7: Order Monitor (age + profit deviation)
         let order_monitor_service = OrderMonitorService {
             bot_state: self.bot_state.clone(),
             pacifica_prices: self.pacifica_prices.clone(),
@@ -550,6 +577,7 @@ impl XemmBot {
             evaluator: self.evaluator.clone(),
             pacifica_trading: self.pacifica_trading_monitor.clone(),
             hyperliquid_trading: self.hyperliquid_trading.clone(),
+            price_update_rx: self.price_update_tx.subscribe(),
         };
         tokio::spawn(async move {
             order_monitor_service.run().await;
@@ -573,13 +601,13 @@ impl XemmBot {
         // MAIN OPPORTUNITY EVALUATION LOOP
         // ═══════════════════════════════════════════════════
 
-        tprintln!("{} Starting opportunity evaluation loop",
+        tprintln!("{} Starting event-driven opportunity evaluation",
             format!("[{} MAIN]", self.config.symbol).bright_white().bold()
         );
         tprintln!("");
 
-        let mut eval_interval = interval(Duration::from_millis(100));
         let mut order_placement_rate_limit = RateLimitTracker::new();
+        let mut price_update_rx = self.price_update_tx.subscribe();
 
         // Helper async function to wait for SIGTERM
         async fn wait_for_sigterm() {
@@ -616,7 +644,9 @@ impl XemmBot {
                     break;
                 }
 
-                _ = eval_interval.tick() => {
+                _ = price_update_rx.recv() => {
+                    // Price update received from orderbook services
+                    // Immediately evaluate opportunities (event-driven, minimal latency)
                     // Check if we should exit
                     let state = self.bot_state.read().await;
                     if state.is_terminal() {
@@ -680,81 +710,29 @@ impl XemmBot {
                             format!("${:.6}", hl_ask).cyan()
                         );
 
-                        // Place order
-                        tprintln!("{} Placing {} on Pacifica...",
-                            format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                            opp.direction.as_str().bright_yellow().bold()
-                        );
-
-                        let pacifica_side = match opp.direction {
-                            OrderSide::Buy => PacificaOrderSide::Buy,
-                            OrderSide::Sell => PacificaOrderSide::Sell,
+                        // Send to order placement queue (non-blocking)
+                        let request = OrderPlacementRequest {
+                            opportunity: opp,
+                            pac_bid,
+                            pac_ask,
                         };
 
-                        match self.pacifica_trading_main
-                            .place_limit_order(
-                                &self.config.symbol,
-                                pacifica_side,
-                                opp.size,
-                                Some(opp.pacifica_price),
-                                0.0,
-                                Some(pac_bid),
-                                Some(pac_ask),
-                            )
-                            .await
-                        {
-                            Ok(order_data) => {
-                                order_placement_rate_limit.record_success();
-
-                                if let Some(client_order_id) = order_data.client_order_id {
-                                    let order_id = order_data.order_id.unwrap_or(0);
-                                    tprintln!(
-                                        "{} {} Placed {} #{} @ {} | cloid: {}...{}",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                                        "✓".green().bold(),
-                                        opp.direction.as_str().bright_yellow(),
-                                        order_id,
-                                        format!("${:.4}", opp.pacifica_price).cyan().bold(),
-                                        &client_order_id[..8],
-                                        &client_order_id[client_order_id.len()-4..]
-                                    );
-
-                                    let active_order = ActiveOrder {
-                                        client_order_id,
-                                        symbol: self.config.symbol.clone(),
-                                        side: opp.direction,
-                                        price: opp.pacifica_price,
-                                        size: opp.size,
-                                        initial_profit_bps: opp.initial_profit_bps,
-                                        placed_at: Instant::now(),
-                                    };
-
-                                    state.set_active_order(active_order);
-                                } else {
-                                    tprintln!("{} {} Order placed but no client_order_id returned",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                                        "✗".red().bold()
-                                    );
-                                }
+                        // Try send (non-blocking)
+                        match self.order_tx.try_send(request) {
+                            Ok(_) => {
+                                // Successfully queued, continue processing price updates
                             }
-                            Err(e) => {
-                                if is_rate_limit_error(&e) {
-                                    order_placement_rate_limit.record_error();
-                                    let backoff_secs = order_placement_rate_limit.get_backoff_secs();
-                                    tprintln!(
-                                        "{} {} Failed to place order: Rate limit exceeded. Backing off for {}s (attempt #{})",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                                        "⚠".yellow().bold(),
-                                        backoff_secs,
-                                        order_placement_rate_limit.consecutive_errors()
-                                    );
-                                } else {
-                                    tprintln!("{} {} Failed to place order: {}",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                                        "✗".red().bold(),
-                                        e.to_string().red()
-                                    );
-                                }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                tprintln!(
+                                    "{} ⚠ Order placement queue full, skipping opportunity",
+                                    format!("[{} ORDER]", self.config.symbol).bright_yellow().bold()
+                                );
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                tprintln!(
+                                    "{} ✗ Order placement service closed",
+                                    format!("[{} ORDER]", self.config.symbol).bright_yellow().bold()
+                                );
                             }
                         }
                     }

@@ -49,13 +49,13 @@ impl OrderbookClient {
         Ok(Self { config, ws_url })
     }
 
-    /// Start the client with a callback for top of book updates
+    /// Start the client with a callback for orderbook updates
     ///
     /// # Arguments
-    /// * `callback` - Function called with (best_bid_price, best_ask_price, symbol, timestamp)
+    /// * `callback` - Function called with OrderbookData
     pub async fn start<F>(&mut self, mut callback: F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64) + Send + 'static,
+        F: FnMut(OrderbookData) + Send + 'static,
     {
         let mut reconnect_count = 0;
 
@@ -97,7 +97,7 @@ impl OrderbookClient {
     /// Internal method to connect and run the WebSocket client
     async fn connect_and_run<F>(&self, callback: &mut F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64),
+        F: FnMut(OrderbookData),
     {
         info!("[PACIFICA] Connecting to {}", self.ws_url);
 
@@ -129,8 +129,14 @@ impl OrderbookClient {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            debug!("[PACIFICA] Received message: {}", text);
-                            self.handle_message(&text, callback)?;
+                            // Log trace for debugging high frequency data
+                            // debug!("[PACIFICA] Received message: {}", text);
+                            
+                            // Handle message with robust error handling
+                            if let Err(e) = self.handle_message(&text, callback) {
+                                error!("[PACIFICA] Error handling message: {}", e);
+                                // Do NOT return error here, continue processing next messages
+                            }
                         }
                         Some(Ok(Message::Close(_))) => {
                             info!("[PACIFICA] Received close message from server");
@@ -174,7 +180,7 @@ impl OrderbookClient {
     /// Handle incoming WebSocket messages
     fn handle_message<F>(&self, text: &str, callback: &mut F) -> Result<()>
     where
-        F: FnMut(String, String, String, u64),
+        F: FnMut(OrderbookData),
     {
         // First try to parse as generic response to check channel
         let response: WebSocketResponse = serde_json::from_str(text)?;
@@ -183,8 +189,7 @@ impl OrderbookClient {
         let channel = match response.channel {
             Some(ch) => ch,
             None => {
-                debug!("[PACIFICA] Received message without channel field, ignoring: {}",
-                    if text.len() > 100 { &text[..100] } else { text });
+                // debug!("[PACIFICA] Received message without channel field, ignoring");
                 return Ok(());
             }
         };
@@ -199,20 +204,8 @@ impl OrderbookClient {
                 let orderbook_response: OrderbookResponse = serde_json::from_str(text)?;
                 let orderbook_data = orderbook_response.data;
 
-                // Extract top of book
-                let tob = orderbook_data.get_top_of_book();
-
-                // Call the callback with top of book data
-                if let (Some(bid), Some(ask)) = (tob.best_bid, tob.best_ask) {
-                    callback(
-                        bid.price,
-                        ask.price,
-                        tob.symbol,
-                        tob.timestamp,
-                    );
-                } else {
-                    warn!("[PACIFICA] Incomplete top of book data received");
-                }
+                // Pass full orderbook data to callback
+                callback(orderbook_data);
 
                 Ok(())
             }

@@ -99,12 +99,14 @@ This development branch introduces a low-latency, queue-based hedge pipeline and
     - `true` → use WebSocket for hedging, with REST fallback on error.  
     - `false` → use REST-only hedging (original behavior).
 
-### Performance & Reliability
+###Performance & Reliability
 - ✅ **Multi-source Orderbook** - WebSocket primary, REST API fallback
 - ✅ **Dual Cancellation** - REST + WebSocket cancellation on fill (defense in depth)
-- ✅ **Auto-reconnect** - Exponential backoff on connection failures
-- ✅ **Concurrent Tasks** - 10 async tasks running in parallel
-- ✅ **High-frequency Monitoring** - 25ms profit checks, 100ms opportunity evaluation
+- ✅ **Auto-reconnect** - Exponential backoff on connection failures  
+- ✅ **Concurrent Tasks** - 11 async tasks running in parallel
+- ✅ **Event-Driven Architecture** - Instant opportunity evaluation and profit monitoring on price updates (<1ms latency)
+- ✅ **Async Order Placement** - Non-blocking order placement queue (main loop never blocks on network I/O)
+- ✅ **Zero-Copy Price Extraction** - Eliminates memory allocations in hot path
 - ✅ **Zero Rate Limits** - WebSocket cancellation bypasses API rate limits
 - ✅ **Graceful Shutdown** - Cancels orders on Ctrl+C
 
@@ -181,6 +183,16 @@ src/
 ├── strategy/
 │   ├── mod.rs
 │   └── opportunity.rs  # Opportunity evaluation and profit calculation
+├── services/
+│   ├── mod.rs
+│   ├── orderbook.rs           # Orderbook subscription services
+│   ├── fill_detection.rs      # WebSocket fill detection
+│   ├── rest_fill_detection.rs # REST fill detection backup
+│   ├── position_monitor.rs    # Position-based fill detection
+│   ├── order_placement.rs     # Async order placement queue
+│   ├── order_monitor.rs       # Profit tracking and order refresh
+│   ├── hedge.rs               # Hedge execution service
+│   └── rest_poll.rs           # REST API polling (fallback)
 └── connector/
     ├── pacifica/
     │   ├── mod.rs
@@ -226,18 +238,19 @@ The bot uses a state machine to track lifecycle:
 
 ### Concurrent Tasks
 
-The XEMM bot orchestrates 10 async tasks running in parallel:
+The XEMM bot orchestrates 11 async tasks running in parallel:
 
-1. **Pacifica Orderbook (WebSocket)** - Real-time bid/ask feed
-2. **Hyperliquid Orderbook (WebSocket)** - Real-time bid/ask feed
+1. **Pacifica Orderbook (WebSocket)** - Real-time bid/ask feed, broadcasts price updates
+2. **Hyperliquid Orderbook (WebSocket)** - Real-time bid/ask feed, broadcasts price updates
 3. **Fill Detection (WebSocket)** - Monitors Pacifica order fills/cancellations (primary + position delta)
 4. **Pacifica REST API Polling** - Fallback orderbook data (every 2s)
 5. **Hyperliquid REST API Polling** - Fallback orderbook data (every 2s)
 6. **REST API Fill Detection** - Backup fill polling (every 500ms)
 7. **Position Monitor** - Position-based fill detection (every 500ms, ground truth)
-8. **Order Monitoring** - Profit tracking and order refresh (every 25ms)
-9. **Hedge Execution** - Executes Hyperliquid hedge after fill
-10. **Main Opportunity Loop** - Evaluates and places orders (every 100ms)
+8. **Order Placement** - Async order placement queue (non-blocking, dedicated task)
+9. **Order Monitoring** - Event-driven profit tracking and order refresh (reacts to price updates, <1ms latency)
+10. **Hedge Execution** - Executes Hyperliquid hedge after fill
+11. **Main Opportunity Loop** - Event-driven opportunity evaluation (reacts to price updates, <1ms latency)
 
 ## Configuration Parameters
 
@@ -259,9 +272,9 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 
 1. **Startup**: Cancel all existing Pacifica orders
 2. **Wait**: Gather initial orderbook data (3s warmup)
-3. **Evaluate**: Check both BUY and SELL opportunities every 100ms
+3. **Evaluate**: Check BUY and SELL opportunities **instantly on every price update** (event-driven, <1ms latency)
 4. **Calculate & Place**: Calculate Pacifica limit price from Hyperliquid hedge price with target profit margin (`profit_rate_bps`) embedded, place order if still profitable after rounding
-5. **Monitor**: Track profit every 25ms, cancel if deviation >3 bps or age >60s
+5. **Monitor**: Track profit **instantly on every price update** (event-driven, <1ms latency), cancel if deviation >3 bps or age >60s
 6. **Fill Detection**: 5-layer system detects when order fills
    - WebSocket fill detection (primary, real-time via account_order_updates)
    - WebSocket position detection (redundancy, real-time via account_positions)

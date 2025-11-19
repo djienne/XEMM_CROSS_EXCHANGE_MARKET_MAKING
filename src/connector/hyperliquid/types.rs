@@ -109,6 +109,13 @@ pub struct L2BookResponsePayload {
     pub data: L2BookData,
 }
 
+/// L2 Book subscription response
+#[derive(Debug, Deserialize)]
+pub struct L2BookSubscriptionResponse {
+    pub channel: String,
+    pub data: L2BookData,
+}
+
 /// L2 orderbook data
 #[derive(Debug, Clone, Deserialize)]
 pub struct L2BookData {
@@ -158,6 +165,24 @@ impl L2BookData {
             coin: self.coin.clone(),
             timestamp: self.time,
         })
+    }
+
+    /// Extract best bid and ask prices as string references (zero-copy, optimized for latency)
+    ///
+    /// Returns (bid_price, ask_price) if both are available, None otherwise
+    pub fn get_best_bid_ask(&self) -> Option<(&str, &str)> {
+        if self.levels.len() < 2 {
+            return None;
+        }
+
+        let bids = &self.levels[0];
+        let asks = &self.levels[1];
+
+        if bids.is_empty() || asks.is_empty() {
+            return None;
+        }
+
+        Some((bids[0].px.as_str(), asks[0].px.as_str()))
     }
 }
 

@@ -29,7 +29,7 @@ macro_rules! tprintln {
 /// 2. Profit deviation - cancels if profit drops > profit_cancel_threshold_bps
 /// 3. Periodic profit logging every 2 seconds
 ///
-/// Checks every 25ms (40 Hz) for fast response to market changes.
+/// Reacts immediately to price updates via event-driven channel.
 pub struct OrderMonitorService {
     pub bot_state: Arc<RwLock<BotState>>,
     pub pacifica_prices: Arc<Mutex<(f64, f64)>>,
@@ -38,19 +38,23 @@ pub struct OrderMonitorService {
     pub evaluator: OpportunityEvaluator,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
+    pub price_update_rx: tokio::sync::broadcast::Receiver<()>,
 }
 
 impl OrderMonitorService {
-    pub async fn run(self) {
-        let mut monitor_interval = interval(Duration::from_millis(25)); // Check every 25ms (40 Hz)
-        let mut log_interval = interval(Duration::from_secs(2)); // Log profit every 2 seconds
+    pub async fn run(mut self) {
+        let mut log_interval = interval(Duration::from_secs(2)); // Check profit every 2 seconds
 
         // Rate limit tracking for cancellations
         let mut cancel_rate_limit = RateLimitTracker::new();
+        
+        // Track last logged profit to avoid spamming logs
+        let mut last_logged_profit: Option<f64> = None;
 
         loop {
             tokio::select! {
-                _ = monitor_interval.tick() => {
+                // React to price updates from orderbook services (event-driven)
+                _ = self.price_update_rx.recv() => {
                     let state = self.bot_state.read().await;
 
                     // Only monitor orders that are actively placed (not filled/hedging/complete)
@@ -460,16 +464,25 @@ impl OrderMonitorService {
                         OrderSide::Sell => hl_ask,
                     };
 
-                    tprintln!(
-                        "{} Current: {} bps (initial: {}, change: {}) | PAC: {} | HL: {} | Age: {}s",
-                        "[PROFIT]".bright_blue().bold(),
-                        format!("{:.2}", current_profit).bright_white().bold(),
-                        format!("{:.2}", active_order.initial_profit_bps).bright_white(),
-                        if profit_change >= 0.0 { format!("{:+.2}", profit_change).green() } else { format!("{:+.2}", profit_change).red() },
-                        format!("${:.4}", active_order.price).cyan(),
-                        format!("${:.4}", hedge_price).cyan(),
-                        format!("{:.3}", age_ms as f64 / 1000.0).bright_white()
-                    );
+                    // Only log if profit has changed significantly (more than 0.01 bps)
+                    let should_log = match last_logged_profit {
+                        Some(last_profit) => (current_profit - last_profit).abs() > 0.01,
+                        None => true, // Always log the first time
+                    };
+
+                    if should_log {
+                        tprintln!(
+                            "{} Current: {} bps (initial: {}, change: {}) | PAC: {} | HL: {} | Age: {}s",
+                            "[PROFIT]".bright_blue().bold(),
+                            format!("{:.2}", current_profit).bright_white().bold(),
+                            format!("{:.2}", active_order.initial_profit_bps).bright_white(),
+                            if profit_change >= 0.0 { format!("{:+.2}", profit_change).green() } else { format!("{:+.2}", profit_change).red() },
+                            format!("${:.4}", active_order.price).cyan(),
+                            format!("${:.4}", hedge_price).cyan(),
+                            format!("{:.3}", age_ms as f64 / 1000.0).bright_white()
+                        );
+                        last_logged_profit = Some(current_profit);
+                    }
                 }
             }
         }
