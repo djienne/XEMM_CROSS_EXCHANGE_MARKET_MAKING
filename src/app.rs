@@ -450,13 +450,10 @@ impl XemmBot {
             symbol: self.config.symbol.clone(),
             reconnect_attempts: self.config.reconnect_attempts,
             ping_interval_secs: self.config.ping_interval_secs,
-            request_interval_ms: 99, // ~10 Hz updates
         };
         tokio::spawn(async move {
             hyperliquid_ob_service.run().await.ok();
         });
-
-        // Service 3: Fill Detection (WebSocket - primary)
         let fill_config = FillDetectionConfig {
             account: self.pacifica_credentials.account.clone(),
             reconnect_attempts: self.config.reconnect_attempts,
@@ -579,7 +576,7 @@ impl XemmBot {
         );
         tprintln!("");
 
-        let mut eval_interval = interval(Duration::from_millis(100));
+        let mut eval_interval = interval(Duration::from_millis(1));
         let mut order_placement_rate_limit = RateLimitTracker::new();
 
         // Helper async function to wait for SIGTERM

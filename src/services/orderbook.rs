@@ -63,7 +63,6 @@ pub struct HyperliquidOrderbookService {
     pub symbol: String,
     pub reconnect_attempts: u32,
     pub ping_interval_secs: u64,
-    pub request_interval_ms: u64,
 }
 
 impl HyperliquidOrderbookService {
@@ -73,7 +72,6 @@ impl HyperliquidOrderbookService {
             coin: self.symbol.clone(),
             reconnect_attempts: self.reconnect_attempts,
             ping_interval_secs: self.ping_interval_secs,
-            request_interval_ms: self.request_interval_ms,
         };
 
         let mut hyperliquid_ob_client = HyperliquidOrderbookClient::new(hyperliquid_ob_config)

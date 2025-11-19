@@ -117,6 +117,13 @@ pub struct L2BookData {
     pub levels: Vec<Vec<BookLevel>>, // [bids, asks]
 }
 
+/// Subscription response for l2Book
+#[derive(Debug, Deserialize)]
+pub struct L2BookSubscriptionResponse {
+    pub channel: String,
+    pub data: L2BookData,
+}
+
 /// Book level with price, size, and number of orders
 #[derive(Debug, Clone, Deserialize)]
 pub struct BookLevel {

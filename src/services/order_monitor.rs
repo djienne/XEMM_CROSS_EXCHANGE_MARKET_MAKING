@@ -42,7 +42,7 @@ pub struct OrderMonitorService {
 
 impl OrderMonitorService {
     pub async fn run(self) {
-        let mut monitor_interval = interval(Duration::from_millis(25)); // Check every 25ms (40 Hz)
+        let mut monitor_interval = interval(Duration::from_millis(1)); // Check every 1ms (1000 Hz)
         let mut log_interval = interval(Duration::from_secs(2)); // Log profit every 2 seconds
 
         // Rate limit tracking for cancellations
