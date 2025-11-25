@@ -4,6 +4,7 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::debug;
 use colored::Colorize;
+use fast_float::parse;
 
 use crate::bot::{BotState, BotStatus};
 use crate::config::Config;
@@ -83,7 +84,7 @@ impl OrderMonitorService {
                 match filled_check_result {
                     Ok(orders) => {
                         if let Some(order) = orders.iter().find(|o| o.client_order_id == active_order.client_order_id) {
-                            let filled_amount: f64 = order.filled_amount.parse().unwrap_or(0.0);
+                            let filled_amount: f64 = parse(&order.filled_amount).unwrap_or(0.0);
 
                             if filled_amount > 0.0 {
                                 // Order has fills - DON'T cancel, let fill detection handle it
@@ -260,7 +261,7 @@ impl OrderMonitorService {
                 match filled_check_result {
                     Ok(orders) => {
                         if let Some(order) = orders.iter().find(|o| o.client_order_id == active_order.client_order_id) {
-                            let filled_amount: f64 = order.filled_amount.parse().unwrap_or(0.0);
+                            let filled_amount: f64 = parse(&order.filled_amount).unwrap_or(0.0);
 
                             if filled_amount > 0.0 {
                                 // Order has fills - DON'T cancel, let fill detection handle it

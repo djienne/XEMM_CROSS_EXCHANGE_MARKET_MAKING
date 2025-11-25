@@ -6,6 +6,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream};
+use fast_float::parse;
 
 use crate::bot::BotState;
 use crate::config::Config;
@@ -83,7 +84,29 @@ impl HedgeService {
             }
         }
 
-        while let Some((side, size, avg_price, fill_timestamp)) = self.hedge_rx.recv().await {
+        // Keep-alive interval for WebSocket pings (5s to keep connection warm)
+        let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                // Send periodic pings to keep WebSocket connection warm
+                _ = keepalive_interval.tick() => {
+                    if let Some(write) = ws_write.as_mut() {
+                        if let Err(e) = write.send(Message::Ping(vec![])).await {
+                            tprintln!("{} {} Failed to send keepalive ping: {}",
+                                format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                "⚠".yellow().bold(),
+                                e
+                            );
+                            // Connection likely dead, clear write handle
+                            ws_write = None;
+                        }
+                    }
+                }
+
+                // Main hedge event processing
+                Some((side, size, avg_price, fill_timestamp)) = self.hedge_rx.recv() => {
             let reception_latency = fill_timestamp.elapsed();
             tprintln!("{} ⚡ HEDGE RECEIVED: {} {} @ {} | Reception latency: {:.1}ms",
                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
@@ -658,7 +681,7 @@ impl HedgeService {
                     let pacifica_position = match self.pacifica_trading.get_positions().await {
                         Ok(positions) => {
                             if let Some(pos) = positions.iter().find(|p| p.symbol == self.config.symbol) {
-                                let amount: f64 = pos.amount.parse().unwrap_or(0.0);
+                                let amount: f64 = parse(&pos.amount).unwrap_or(0.0);
                                 let signed_amount = if pos.side == "bid" { amount } else { -amount };
 
                                 tprintln!("{} Pacifica: {} {} (signed: {:.4})",
@@ -702,7 +725,7 @@ impl HedgeService {
                         match self.hyperliquid_trading.get_user_state(&hl_wallet).await {
                             Ok(user_state) => {
                                 if let Some(asset_pos) = user_state.asset_positions.iter().find(|ap| ap.position.coin == self.config.symbol) {
-                                    let szi: f64 = asset_pos.position.szi.parse().unwrap_or(0.0);
+                                    let szi: f64 = parse(&asset_pos.position.szi).unwrap_or(0.0);
                                     tprintln!("{} Hyperliquid: {} (signed: {:.4})",
                                         format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
                                         if szi > 0.0 { "LONG".green() } else if szi < 0.0 { "SHORT".red() } else { "FLAT".bright_white() },
@@ -829,7 +852,9 @@ impl HedgeService {
                     self.shutdown_tx.send(()).await.ok();
                 }
             }
-        }
+                } // Close Some((side, size, avg_price, fill_timestamp)) arm
+            } // Close tokio::select!
+        } // Close loop
     }
 
     /// Establish a Hyperliquid trading WebSocket connection for hedging.

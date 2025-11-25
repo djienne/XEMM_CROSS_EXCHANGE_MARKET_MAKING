@@ -30,3 +30,7 @@ ethers = { version = "2.0", features = ["legacy"] }
 rmp-serde = "1.1"
 hex = "0.4"
 colored = "2.1"
+parking_lot = "0.12"
+crossfire = "2.1"
+bloomfilter = "1.0"
+fast-float = "0.2"

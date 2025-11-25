@@ -66,8 +66,8 @@ pub struct XemmBot {
     pub evaluator: OpportunityEvaluator,
 
     // Fill tracking state
-    pub processed_fills: Arc<tokio::sync::Mutex<HashSet<String>>>,
-    pub last_position_snapshot: Arc<tokio::sync::Mutex<Option<PositionSnapshot>>>,
+    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pub last_position_snapshot: Arc<parking_lot::Mutex<Option<PositionSnapshot>>>,
 
     // Channels
     pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
@@ -388,8 +388,8 @@ impl XemmBot {
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
 
         // Fill tracking state
-        let processed_fills = Arc::new(tokio::sync::Mutex::new(HashSet::<String>::new()));
-        let last_position_snapshot = Arc::new(tokio::sync::Mutex::new(Option::<PositionSnapshot>::None));
+        let processed_fills = Arc::new(parking_lot::Mutex::new(HashSet::<String>::new()));
+        let last_position_snapshot = Arc::new(parking_lot::Mutex::new(Option::<PositionSnapshot>::None));
 
         println!(
             "{} {} {}",

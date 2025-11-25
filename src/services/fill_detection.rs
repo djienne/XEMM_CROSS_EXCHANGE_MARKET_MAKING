@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::debug;
 use colored::Colorize;
+use fast_float::parse;
 
 use crate::bot::{BotState, BotStatus};
 use crate::connector::pacifica::{
@@ -31,7 +32,7 @@ pub struct FillDetectionService {
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub fill_config: FillDetectionConfig,
     pub symbol: String,
-    pub processed_fills: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub baseline_updater: PositionBaselineUpdater,
 }
 
@@ -109,7 +110,7 @@ impl FillDetectionService {
                                 // Check if this fill was already processed (prevent duplicate hedges)
                                 let fill_id = cloid.as_ref().map(|id| format!("full_{}", id)).unwrap_or_default();
                                 {
-                                    let mut processed = processed_fills_clone.lock().await;
+                                    let mut processed = processed_fills_clone.lock();
                                     if processed.contains(&fill_id) {
                                         debug!("[FILL_DETECTION] Full fill already processed (duplicate), skipping");
                                         return;
@@ -131,7 +132,7 @@ impl FillDetectionService {
                                     }
                                 };
 
-                                let filled_size: f64 = filled_amount_str.parse().unwrap_or(0.0);
+                                let filled_size: f64 = parse(&filled_amount_str).unwrap_or(0.0);
 
                                 {
                                     let mut state = bot_state_clone.write().await;
@@ -184,7 +185,7 @@ impl FillDetectionService {
 
                                 // *** CRITICAL: UPDATE POSITION BASELINE ***
                                 // This prevents position-based detection from triggering duplicate hedge
-                                let avg_px: f64 = avg_price_str.parse().unwrap_or(0.0);
+                                let avg_px: f64 = parse(&avg_price_str).unwrap_or(0.0);
                                 baseline_updater_clone.update_baseline(
                                     &symbol_clone,
                                     &side_str,
@@ -265,8 +266,8 @@ impl FillDetectionService {
                         ..
                     } => {
                         // Calculate notional value of partial fill
-                        let filled_size: f64 = filled_amount.parse().unwrap_or(0.0);
-                        let fill_price: f64 = avg_price.parse().unwrap_or(0.0);
+                        let filled_size: f64 = parse(&filled_amount).unwrap_or(0.0);
+                        let fill_price: f64 = parse(&avg_price).unwrap_or(0.0);
                         let notional_value = filled_size * fill_price;
 
                         tprintln!(
@@ -318,7 +319,7 @@ impl FillDetectionService {
                                     // Check if this fill was already processed (prevent duplicate hedges)
                                     let fill_id = cloid.as_ref().map(|id| format!("partial_{}", id)).unwrap_or_default();
                                     {
-                                        let mut processed = processed_fills_clone.lock().await;
+                                        let mut processed = processed_fills_clone.lock();
                                         if processed.contains(&fill_id) {
                                             debug!("[FILL_DETECTION] Partial fill already processed (duplicate), skipping");
                                             return;
@@ -339,7 +340,7 @@ impl FillDetectionService {
                                         }
                                     };
 
-                                    let filled_size: f64 = filled_amount_str.parse().unwrap_or(0.0);
+                                    let filled_size: f64 = parse(&filled_amount_str).unwrap_or(0.0);
 
                                     {
                                         let mut state = bot_state_clone.write().await;
@@ -391,7 +392,7 @@ impl FillDetectionService {
                                     });
 
                                     // *** CRITICAL: UPDATE POSITION BASELINE ***
-                                    let avg_px: f64 = avg_price_str.parse().unwrap_or(0.0);
+                                    let avg_px: f64 = parse(&avg_price_str).unwrap_or(0.0);
                                     baseline_updater_clone.update_baseline(
                                         &symbol_clone,
                                         &side_str,

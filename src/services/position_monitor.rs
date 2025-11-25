@@ -1,10 +1,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
 use tracing::debug;
 use colored::Colorize;
+use fast_float::parse;
+use parking_lot::Mutex;
 
 use crate::app::PositionSnapshot;
 use crate::bot::BotState;
@@ -39,11 +41,15 @@ pub struct PositionMonitorService {
 
 impl PositionMonitorService {
     pub async fn run(self) {
-        let mut poll_interval = interval(Duration::from_millis(500)); // 500ms polling
-        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
         loop {
-            poll_interval.tick().await;
+            // Adaptive polling: fast when order active, slow when idle
+            let has_active_order = {
+                let state = self.bot_state.read().await;
+                state.has_active_order_fast()
+            };
+
+            let poll_ms = if has_active_order { 250 } else { 2000 };
+            tokio::time::sleep(Duration::from_millis(poll_ms)).await;
 
             // Only check if we have an active order
             let active_order_info = {
@@ -67,10 +73,10 @@ impl PositionMonitorService {
                 match self.pacifica_trading.get_positions().await {
                     Ok(positions) => {
                         let position = positions.iter().find(|p| p.symbol == self.symbol);
-                        let mut snapshot = self.last_position_snapshot.lock().await;
+                        let mut snapshot = self.last_position_snapshot.lock();
 
                         if let Some(pos) = position {
-                            let amount: f64 = pos.amount.parse().unwrap_or(0.0);
+                            let amount: f64 = parse(&pos.amount).unwrap_or(0.0);
                             *snapshot = Some(PositionSnapshot {
                                 amount,
                                 side: pos.side.clone(),
@@ -98,7 +104,7 @@ impl PositionMonitorService {
             match positions_result {
                 Ok(positions) => {
                     let current_position = positions.iter().find(|p| p.symbol == self.symbol);
-                    let last_snapshot = self.last_position_snapshot.lock().await.clone();
+                    let last_snapshot = self.last_position_snapshot.lock().clone();
 
                     // Calculate position delta
                     let (last_amount, last_side) = if let Some(ref snap) = last_snapshot {
@@ -169,7 +175,7 @@ impl PositionMonitorService {
                             );
 
                             // Update snapshot to prevent continuous detection
-                            let mut snapshot = self.last_position_snapshot.lock().await;
+                            let mut snapshot = self.last_position_snapshot.lock();
                             *snapshot = Some(PositionSnapshot {
                                 amount: current_amount,
                                 side: current_side,
@@ -180,12 +186,17 @@ impl PositionMonitorService {
 
                         // Check if already processed - use consistent fill_id format with WebSocket detection
                         let fill_id = format!("full_{}", client_order_id);
-                        let mut processed = self.processed_fills.lock().await;
+                        let should_process = {
+                            let mut processed = self.processed_fills.lock();
+                            if !processed.contains(&fill_id) {
+                                processed.insert(fill_id.clone());
+                                true
+                            } else {
+                                false
+                            }
+                        }; // MutexGuard is dropped here
 
-                        if !processed.contains(&fill_id) {
-                            processed.insert(fill_id.clone());
-                            drop(processed);
-
+                        if should_process {
                             tprintln!(
                                 "{} {} FILL DETECTED via position change!",
                                 "[POSITION_MONITOR]".bright_cyan().bold(),
@@ -262,7 +273,7 @@ impl PositionMonitorService {
                         }
 
                         // Update snapshot
-                        let mut snapshot = self.last_position_snapshot.lock().await;
+                        let mut snapshot = self.last_position_snapshot.lock();
                         *snapshot = Some(PositionSnapshot {
                             amount: current_amount,
                             side: current_side,
