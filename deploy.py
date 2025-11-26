@@ -271,12 +271,42 @@ def deploy_with_rsync():
 
     try:
         result = subprocess.run(cmd, timeout=300)
-        return result.returncode == 0
+        if result.returncode == 0:
+            # Fix line endings after rsync
+            fix_remote_line_endings()
+            return True
+        return False
     except subprocess.TimeoutExpired:
         print_error("Rsync deployment timed out after 5 minutes")
         return False
     except Exception as e:
         print_error(f"Rsync deployment failed: {e}")
+        return False
+
+
+def fix_remote_line_endings():
+    """Fix Windows line endings (CRLF -> LF) on all .sh files on remote server."""
+    print_info("Fixing line endings on remote shell scripts...")
+
+    cmd = [
+        "ssh",
+        "-i", SSH_KEY,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ConnectTimeout=30",
+        f"{REMOTE_USER}@{REMOTE_HOST}",
+        f"cd {REMOTE_PATH} && find . -type f -name '*.sh' -exec sed -i 's/\\r$//' {{}} \\;"
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            print_success("Fixed line endings on all .sh files")
+            return True
+        else:
+            print_warning(f"Line ending fix had issues: {result.stderr}")
+            return False
+    except Exception as e:
+        print_warning(f"Could not fix line endings: {e}")
         return False
 
 
@@ -366,6 +396,11 @@ def deploy_with_scp():
         if result.returncode != 0:
             print_error(f"Failed to extract archive: {result.stderr}")
             return False
+
+        print_success("Archive extracted successfully")
+
+        # Fix line endings on shell scripts
+        fix_remote_line_endings()
 
         print_success("Deployment completed successfully")
         return True

@@ -40,6 +40,15 @@ function getSshCommand(remoteCmd) {
     return `ssh -i "${SSH_KEY_PATH}" -o StrictHostKeyChecking=no ${REMOTE_USER}@${REMOTE_HOST} "${remoteCmd}"`;
 }
 
+// Helper to fix line endings on remote shell scripts
+async function fixRemoteLineEndings() {
+    // Use find to recursively fix all .sh files, with proper escaping for SSH
+    const fixCmd = `cd ${REMOTE_PATH} && find . -type f -name '*.sh' -exec sed -i 's/\\r$//' {} \\;`;
+    const result = await runCommand(getSshCommand(fixCmd));
+    console.log('Fixed line endings on remote .sh files:', result.success ? 'SUCCESS' : 'FAILED');
+    return result;
+}
+
 // API Routes
 
 // Get Status
@@ -69,8 +78,7 @@ app.post('/api/deploy', async (req, res) => {
     const result = await runCommand(cmd);
 
     // Fix line endings on all .sh scripts after deploy
-    const fixLineEndingsCmd = `cd ${REMOTE_PATH} && find . -name "*.sh" -exec sed -i 's/\\r$//' {} +`;
-    await runCommand(getSshCommand(fixLineEndingsCmd));
+    await fixRemoteLineEndings();
 
     res.json(result);
 });
@@ -78,8 +86,7 @@ app.post('/api/deploy', async (req, res) => {
 // Start Bot
 app.post('/api/start', async (req, res) => {
     // Fix line endings on all .sh scripts before running
-    const fixLineEndingsCmd = `cd ${REMOTE_PATH} && find . -name "*.sh" -exec sed -i 's/\\r$//' {} +`;
-    await runCommand(getSshCommand(fixLineEndingsCmd));
+    await fixRemoteLineEndings();
 
     const cmd = `python run_remote.py`;
     const result = await runCommand(cmd);
@@ -89,8 +96,7 @@ app.post('/api/start', async (req, res) => {
 // Stop Bot
 app.post('/api/stop', async (req, res) => {
     // Fix line endings on all .sh scripts before running
-    const fixLineEndingsCmd = `cd ${REMOTE_PATH} && find . -name "*.sh" -exec sed -i 's/\\r$//' {} +`;
-    await runCommand(getSshCommand(fixLineEndingsCmd));
+    await fixRemoteLineEndings();
 
     const remoteCmd = `cd ${REMOTE_PATH} && bash kill_process.sh`;
     const cmd = getSshCommand(remoteCmd);
