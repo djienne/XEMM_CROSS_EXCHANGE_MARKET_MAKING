@@ -257,6 +257,30 @@ async function syncTrades() {
     }
 }
 
+async function refreshTradeStats() {
+    const originalText = event.target.textContent;
+    event.target.textContent = 'Downloading...';
+    event.target.disabled = true;
+
+    try {
+        const response = await fetch(`${API_BASE}/sync_trades`, { method: 'POST' });
+        const data = await response.json();
+
+        if (data.success) {
+            await fetchTrades();
+        } else {
+            console.error('Failed to download trades:', data.stderr);
+            alert('Failed to download trades. Check console for details.');
+        }
+    } catch (error) {
+        console.error('Error downloading trades:', error);
+        alert('Error downloading trades: ' + error.message);
+    } finally {
+        event.target.textContent = originalText;
+        event.target.disabled = false;
+    }
+}
+
 async function fetchTrades() {
     tradesBody.innerHTML = '<tr><td colspan="5" class="text-center">Loading trades...</td></tr>';
 
