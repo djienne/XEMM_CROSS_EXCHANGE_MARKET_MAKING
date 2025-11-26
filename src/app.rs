@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::signal;
@@ -17,7 +18,8 @@ use crate::connector::pacifica::{
     PacificaWsTrading, OrderSide as PacificaOrderSide,
 };
 use crate::services::{
-    fill_detection::FillDetectionService, hedge::HedgeService, order_monitor::OrderMonitorService,
+    fill_detection::FillDetectionService, hedge::HedgeService,
+    order_monitor::{AtomicBotStatus, OrderMonitorService, SharedOrderSnapshot, spawn_monitor_tasks},
     orderbook::{HyperliquidOrderbookService, PacificaOrderbookService},
     position_monitor::PositionMonitorService, rest_fill_detection::RestFillDetectionService,
     rest_poll::{HyperliquidRestPollService, PacificaRestPollService}, HedgeEvent,
@@ -68,6 +70,10 @@ pub struct XemmBot {
     // Fill tracking state
     pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub last_position_snapshot: Arc<parking_lot::Mutex<Option<PositionSnapshot>>>,
+
+    // Order monitor state (lock-free)
+    pub atomic_status: Arc<AtomicU8>,
+    pub order_snapshot: Arc<SharedOrderSnapshot>,
 
     // Channels
     pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
@@ -411,6 +417,10 @@ impl XemmBot {
         );
         println!();
 
+        // Initialize order monitor state
+        let atomic_status = Arc::new(AtomicU8::new(AtomicBotStatus::Idle as u8));
+        let order_snapshot = Arc::new(SharedOrderSnapshot::new());
+
         Ok(XemmBot {
             config,
             bot_state,
@@ -427,6 +437,8 @@ impl XemmBot {
             evaluator,
             processed_fills,
             last_position_snapshot,
+            atomic_status,
+            order_snapshot,
             hedge_tx,
             hedge_rx: Some(hedge_rx),
             shutdown_tx,
@@ -550,18 +562,19 @@ impl XemmBot {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Service 6: Order Monitor (age/profit monitoring)
-        let order_monitor_service = OrderMonitorService {
-            bot_state: self.bot_state.clone(),
-            pacifica_prices: self.pacifica_prices.clone(),
-            hyperliquid_prices: self.hyperliquid_prices.clone(),
-            config: self.config.clone(),
-            evaluator: self.evaluator.clone(),
-            pacifica_trading: self.pacifica_trading_monitor.clone(),
-            hyperliquid_trading: self.hyperliquid_trading.clone(),
-        };
-        tokio::spawn(async move {
-            order_monitor_service.run().await;
-        });
+        let (order_monitor_service, cancel_rx) = OrderMonitorService::new(
+            self.bot_state.clone(),
+            self.atomic_status.clone(),
+            self.order_snapshot.clone(),
+            self.pacifica_prices.clone(),
+            self.hyperliquid_prices.clone(),
+            self.config.clone(),
+            self.evaluator.clone(),
+            self.pacifica_trading_monitor.clone(),
+            self.hyperliquid_trading.clone(),
+        );
+        let order_monitor_service = Arc::new(order_monitor_service);
+        spawn_monitor_tasks(order_monitor_service, cancel_rx);
 
         // Service 7: Hedge Execution
         let hedge_service = HedgeService {
@@ -660,9 +673,15 @@ impl XemmBot {
                         continue;
                     }
 
+                    // Get timestamp once for this evaluation cycle
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+
                     // Evaluate opportunities
-                    let buy_opp = self.evaluator.evaluate_buy_opportunity(hl_bid, self.config.order_notional_usd);
-                    let sell_opp = self.evaluator.evaluate_sell_opportunity(hl_ask, self.config.order_notional_usd);
+                    let buy_opp = self.evaluator.evaluate_buy_opportunity(hl_bid, self.config.order_notional_usd, now_ms);
+                    let sell_opp = self.evaluator.evaluate_sell_opportunity(hl_ask, self.config.order_notional_usd, now_ms);
 
                     let pac_mid = (pac_bid + pac_ask) / 2.0;
                     let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
