@@ -35,6 +35,7 @@ pub struct RestFillDetectionService {
     pub symbol: String,
     pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub min_hedge_notional: f64,
+    pub poll_interval_ms: u64,
 }
 
 impl RestFillDetectionService {
@@ -49,7 +50,7 @@ impl RestFillDetectionService {
                 state.has_active_order_fast() || matches!(state.status, crate::bot::BotStatus::Filled | crate::bot::BotStatus::Hedging)
             };
 
-            let poll_ms = if has_active_order { 100 } else { 1000 };
+            let poll_ms = if has_active_order { self.poll_interval_ms } else { 1000 };
             tokio::time::sleep(Duration::from_millis(poll_ms)).await;
 
             // Get active order info, with recovery logic for recent cancellations

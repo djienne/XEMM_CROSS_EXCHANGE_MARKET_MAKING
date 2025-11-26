@@ -9,6 +9,7 @@
   "profit_cancel_threshold_bps": 3.0,
   "order_refresh_interval_secs": 60,
   "hyperliquid_slippage": 0.05,
-  "pacifica_rest_poll_interval_secs": 2
+  "pacifica_rest_poll_interval_secs": 2,
+  "pacifica_active_order_rest_poll_interval_ms": 250
 }
 

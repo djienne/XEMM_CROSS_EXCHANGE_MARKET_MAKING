@@ -61,6 +61,11 @@ pub struct Config {
     /// Pacifica REST API polling interval in seconds (complement to WebSocket)
     #[serde(default = "default_pacifica_rest_poll_interval")]
     pub pacifica_rest_poll_interval_secs: u64,
+
+    /// Pacifica REST poll interval for active orders (ms).
+    /// Used by REST fill detection to poll more frequently when an order is active.
+    #[serde(default = "default_pacifica_active_order_rest_poll_interval")]
+    pub pacifica_active_order_rest_poll_interval_ms: u64,
 }
 
 // Default values
@@ -116,6 +121,10 @@ fn default_pacifica_rest_poll_interval() -> u64 {
     2 // 2 seconds
 }
 
+fn default_pacifica_active_order_rest_poll_interval() -> u64 {
+    500 // 500 ms (safer than 100ms to avoid rate limits)
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -133,6 +142,7 @@ impl Default for Config {
             hyperliquid_slippage: default_hyperliquid_slippage(),
             hyperliquid_use_ws_for_hedge: default_hyperliquid_use_ws_for_hedge(),
             pacifica_rest_poll_interval_secs: default_pacifica_rest_poll_interval(),
+            pacifica_active_order_rest_poll_interval_ms: default_pacifica_active_order_rest_poll_interval(),
         }
     }
 }

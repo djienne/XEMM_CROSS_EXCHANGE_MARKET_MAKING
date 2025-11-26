@@ -203,6 +203,15 @@ impl XemmBot {
             format!("{} secs", config.pacifica_rest_poll_interval_secs).bright_white()
         );
         println!(
+            "{} {} Active Order REST Poll Interval: {}",
+            chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+                .to_string()
+                .bright_black(),
+            "[CONFIG]".blue().bold(),
+            format!("{} ms", config.pacifica_active_order_rest_poll_interval_ms).bright_white()
+        );
+        println!(
             "{} {} Hyperliquid Market Order maximum allowed Slippage: {}",
             chrono::Utc::now()
                 .format("%Y-%m-%dT%H:%M:%S%.6fZ")
@@ -514,6 +523,7 @@ impl XemmBot {
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
             min_hedge_notional: 10.0,
+            poll_interval_ms: self.config.pacifica_active_order_rest_poll_interval_ms,
         };
         tokio::spawn(async move {
             rest_fill_service.run().await;
