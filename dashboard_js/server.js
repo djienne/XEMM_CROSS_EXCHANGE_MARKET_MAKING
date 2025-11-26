@@ -25,7 +25,7 @@ const SSH_KEY_PATH = path.join(BASE_DIR, SSH_KEY_NAME);
 function runCommand(command, cwd = BASE_DIR) {
     return new Promise((resolve, reject) => {
         console.log(`Executing: ${command}`);
-        exec(command, { cwd: cwd, maxBuffer: 1024 * 1024 * 10, timeout: 30000 }, (error, stdout, stderr) => {
+        exec(command, { cwd: cwd, maxBuffer: 1024 * 1024 * 10, timeout: 120000 }, (error, stdout, stderr) => {
             if (error) {
                 console.warn(`Command failed: ${error.message}`);
                 resolve({ success: false, stdout: stdout, stderr: stderr || error.message });

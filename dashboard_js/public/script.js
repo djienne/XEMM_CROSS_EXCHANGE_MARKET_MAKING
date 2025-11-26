@@ -83,7 +83,8 @@ async function fetchConfig() {
             'reconnect_attempts',
             'ping_interval_secs',
             'hyperliquid_slippage',
-            'pacifica_rest_poll_interval_secs'
+            'pacifica_rest_poll_interval_secs',
+            'pacifica_active_order_rest_poll_interval_ms'
         ];
 
         for (const [key, value] of Object.entries(data)) {
@@ -258,9 +259,10 @@ async function syncTrades() {
 }
 
 async function refreshTradeStats() {
-    const originalText = event.target.textContent;
-    event.target.textContent = 'Downloading...';
-    event.target.disabled = true;
+    const btn = event.target || event.srcElement;
+    const originalText = btn.textContent;
+    btn.textContent = 'Downloading...';
+    btn.disabled = true;
 
     try {
         const response = await fetch(`${API_BASE}/sync_trades`, { method: 'POST' });
@@ -276,8 +278,8 @@ async function refreshTradeStats() {
         console.error('Error downloading trades:', error);
         alert('Error downloading trades: ' + error.message);
     } finally {
-        event.target.textContent = originalText;
-        event.target.disabled = false;
+        btn.textContent = originalText;
+        btn.disabled = false;
     }
 }
 
