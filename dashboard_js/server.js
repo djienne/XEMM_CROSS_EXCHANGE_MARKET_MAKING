@@ -67,11 +67,20 @@ app.get('/api/status', async (req, res) => {
 app.post('/api/deploy', async (req, res) => {
     const cmd = `python deploy.py`;
     const result = await runCommand(cmd);
+
+    // Fix line endings on all .sh scripts after deploy
+    const fixLineEndingsCmd = `cd ${REMOTE_PATH} && find . -name "*.sh" -exec sed -i 's/\\r$//' {} +`;
+    await runCommand(getSshCommand(fixLineEndingsCmd));
+
     res.json(result);
 });
 
 // Start Bot
 app.post('/api/start', async (req, res) => {
+    // Fix line endings on all .sh scripts before running
+    const fixLineEndingsCmd = `cd ${REMOTE_PATH} && find . -name "*.sh" -exec sed -i 's/\\r$//' {} +`;
+    await runCommand(getSshCommand(fixLineEndingsCmd));
+
     const cmd = `python run_remote.py`;
     const result = await runCommand(cmd);
     res.json(result);
@@ -79,6 +88,10 @@ app.post('/api/start', async (req, res) => {
 
 // Stop Bot
 app.post('/api/stop', async (req, res) => {
+    // Fix line endings on all .sh scripts before running
+    const fixLineEndingsCmd = `cd ${REMOTE_PATH} && find . -name "*.sh" -exec sed -i 's/\\r$//' {} +`;
+    await runCommand(getSshCommand(fixLineEndingsCmd));
+
     const remoteCmd = `cd ${REMOTE_PATH} && bash kill_process.sh`;
     const cmd = getSshCommand(remoteCmd);
     const result = await runCommand(cmd);
