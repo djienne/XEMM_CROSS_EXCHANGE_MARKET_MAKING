@@ -19,7 +19,7 @@ use crate::connector::pacifica::{
 };
 use crate::services::{
     fill_detection::FillDetectionService, hedge::HedgeService,
-    order_monitor::{AtomicBotStatus, OrderMonitorService, SharedOrderSnapshot, spawn_monitor_tasks},
+    order_monitor::{AtomicBotStatus, OrderMonitorService, SharedOrderSnapshot, spawn_monitor_tasks, sync_atomic_status, update_order_snapshot},
     orderbook::{HyperliquidOrderbookService, PacificaOrderbookService},
     position_monitor::PositionMonitorService, rest_fill_detection::RestFillDetectionService,
     rest_poll::{HyperliquidRestPollService, PacificaRestPollService}, HedgeEvent,
@@ -494,6 +494,8 @@ impl XemmBot {
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
             baseline_updater,
+            atomic_status: self.atomic_status.clone(),
+            order_snapshot: self.order_snapshot.clone(),
         };
         tokio::spawn(async move {
             fill_service.run().await;
@@ -757,6 +759,16 @@ impl XemmBot {
                                     };
 
                                     state.set_active_order(active_order);
+
+                                    // Sync atomic status and order snapshot for order monitor
+                                    sync_atomic_status(&self.atomic_status, &state.status);
+                                    update_order_snapshot(
+                                        &self.order_snapshot,
+                                        opp.direction,
+                                        opp.pacifica_price,
+                                        opp.size,
+                                        opp.initial_profit_bps,
+                                    );
                                 } else {
                                     tprintln!("{} {} Order placed but no client_order_id returned",
                                         format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),

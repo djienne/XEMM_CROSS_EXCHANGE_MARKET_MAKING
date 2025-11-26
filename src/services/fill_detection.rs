@@ -34,6 +34,8 @@ pub struct FillDetectionService {
     pub symbol: String,
     pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub baseline_updater: PositionBaselineUpdater,
+    pub atomic_status: Arc<std::sync::atomic::AtomicU8>,
+    pub order_snapshot: Arc<crate::services::order_monitor::SharedOrderSnapshot>,
 }
 
 impl FillDetectionService {
@@ -60,6 +62,8 @@ impl FillDetectionService {
         let symbol = self.symbol.clone();
         let processed_fills = self.processed_fills.clone();
         let baseline_updater = self.baseline_updater.clone();
+        let atomic_status = self.atomic_status.clone();
+        let order_snapshot = self.order_snapshot.clone();
 
         fill_client
             .start(move |fill_event| {
@@ -217,6 +221,8 @@ impl FillDetectionService {
                         // Spawn async task to handle the cancellation
                         let bot_state_clone = bot_state.clone();
                         let cloid = client_order_id.clone();
+                        let atomic_status_clone = atomic_status.clone();
+                        let order_snapshot_clone = order_snapshot.clone();
 
                         tokio::spawn(async move {
                             let mut state = bot_state_clone.write().await;
@@ -234,6 +240,9 @@ impl FillDetectionService {
                                     BotStatus::OrderPlaced => {
                                         // Normal cancellation (monitor refresh, profit deviation, etc.)
                                         state.clear_active_order();
+                                        // Sync atomic status and clear order snapshot
+                                        crate::services::order_monitor::sync_atomic_status(&atomic_status_clone, &state.status);
+                                        order_snapshot_clone.set(None);
                                         debug!("[BOT] Active order cancelled, returning to Idle");
                                     }
                                     BotStatus::Filled | BotStatus::Hedging | BotStatus::Complete => {
