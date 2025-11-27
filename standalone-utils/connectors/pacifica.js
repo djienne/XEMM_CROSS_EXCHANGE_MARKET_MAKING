@@ -196,6 +196,18 @@ class PacificaConnector extends EventEmitter {
         return;
       }
 
+      // Handle account info (balance/equity)
+      if (message.channel === 'account_info') {
+        this.handleAccountInfo(message.data);
+        return;
+      }
+
+      // Handle account positions
+      if (message.channel === 'account_positions') {
+        this.handleAccountPositions(message.data);
+        return;
+      }
+
       // Handle account trades (fills)
       if (message.channel === 'account_trades') {
         this.handleAccountTrades(message.data);
@@ -350,6 +362,51 @@ class PacificaConnector extends EventEmitter {
   }
 
   /**
+   * Handle account info updates (balance/equity)
+   */
+  handleAccountInfo(data) {
+    if (!data) return;
+
+    const info = {
+      account: data.u,
+      timestamp: data.t,
+      equity: parseFloat(data.ae || 0), // Account equity
+      availableToSpend: parseFloat(data.as || 0), // Available to spend
+      availableToWithdraw: parseFloat(data.aw || 0), // Available to withdraw
+      balance: parseFloat(data.b || 0), // Wallet balance
+      marginUsed: parseFloat(data.mu || 0),
+      crossMaintenanceMargin: parseFloat(data.cm || 0),
+      feeTier: data.f,
+      positionsCount: data.pc,
+      ordersCount: data.oc
+    };
+
+    this.emit('accountInfo', info);
+  }
+
+  /**
+   * Handle account positions updates
+   */
+  handleAccountPositions(data) {
+    if (!Array.isArray(data)) {
+      data = [data];
+    }
+
+    const positions = data.map(pos => ({
+      symbol: pos.s,
+      side: pos.d === 'bid' ? 'long' : 'short',
+      amount: parseFloat(pos.a || 0),
+      entryPrice: parseFloat(pos.p || 0),
+      margin: parseFloat(pos.m || 0),
+      funding: parseFloat(pos.f || 0),
+      isolated: pos.i,
+      timestamp: pos.t
+    }));
+
+    this.emit('accountPositions', positions);
+  }
+
+  /**
    * Get bid and ask prices for a coin
    */
   getBidAsk(coin) {
@@ -477,6 +534,54 @@ class PacificaConnector extends EventEmitter {
     } catch (error) {
       console.error(`[Pacifica] Failed to subscribe to order updates:`, error.message);
       throw error;
+    }
+  }
+
+  /**
+   * Subscribe to account info (balance/equity) updates
+   */
+  async subscribeAccountInfo(account = null) {
+    account = account || this.account;
+    if (!account) throw new Error('Account address required');
+
+    if (this.connected && !this.useRestFallback) {
+      try {
+        const msg = {
+          method: 'subscribe',
+          params: {
+            source: 'account_info',
+            account: account
+          }
+        };
+        this.ws.send(JSON.stringify(msg));
+        console.log(`[Pacifica] Subscribed to account info for ${account}`);
+      } catch (error) {
+        console.error(`[Pacifica] Failed to subscribe to account info:`, error.message);
+      }
+    }
+  }
+
+  /**
+   * Subscribe to account positions updates
+   */
+  async subscribeAccountPositions(account = null) {
+    account = account || this.account;
+    if (!account) throw new Error('Account address required');
+
+    if (this.connected && !this.useRestFallback) {
+      try {
+        const msg = {
+          method: 'subscribe',
+          params: {
+            source: 'account_positions',
+            account: account
+          }
+        };
+        this.ws.send(JSON.stringify(msg));
+        console.log(`[Pacifica] Subscribed to account positions for ${account}`);
+      } catch (error) {
+        console.error(`[Pacifica] Failed to subscribe to account positions:`, error.message);
+      }
     }
   }
 

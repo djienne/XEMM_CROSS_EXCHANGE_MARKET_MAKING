@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import React, { useState, useEffect, createElement as h } from 'react';
-import { render, Box, Text } from 'ink';
+import { render, Box, Text, Spacer } from 'ink';
 import { readFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -11,55 +11,13 @@ import PacificaConnector from './connectors/pacifica.js';
 // ============================================================================
 // DEBUG MODE
 // ============================================================================
-// Set DEBUG=true in .env to enable debug logging
 const DEBUG_MODE = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
 
-// Logger wrapper that respects debug mode
 const logger = {
   log: (...args) => DEBUG_MODE && console.log('[Dashboard]', ...args),
   error: (...args) => console.error('[Dashboard ERROR]', ...args),
   warn: (...args) => DEBUG_MODE && console.warn('[Dashboard WARN]', ...args),
   info: (...args) => DEBUG_MODE && console.log('[Dashboard INFO]', ...args)
-};
-
-// Simple table component (replacing ink-table)
-const Table = ({ data }) => {
-  if (!data || data.length === 0) {
-    return h(Text, { color: 'gray' }, 'No data');
-  }
-
-  const headers = Object.keys(data[0]);
-  const columnWidths = {};
-
-  // Calculate column widths with padding
-  headers.forEach(header => {
-    columnWidths[header] = Math.max(
-      header.length,
-      ...data.map(row => String(row[header] || '').length)
-    ) + 4; // Add 4 spaces padding for better column separation
-  });
-
-  // Render header with proper alignment
-  const headerText = headers.map(h => {
-    const colName = String(h);
-    return colName.padEnd(columnWidths[h]);
-  }).join('  '); // Add explicit 2-space separator
-
-  const separator = headers.map(h => '─'.repeat(columnWidths[h])).join('  '); // Match header separator
-
-  return h(Box, { flexDirection: 'column' },
-    h(Text, { bold: true, color: 'cyan' }, headerText),
-    h(Text, { color: 'gray' }, separator),
-    ...data.map((row, i) => {
-      const rowText = headers.map(h => {
-        const value = row[h] !== undefined && row[h] !== null ? String(row[h]) : '';
-        // Right-align numbers, left-align text
-        const isNumber = value && !isNaN(parseFloat(value)) && value.match(/^-?\d+\.?\d*$/);
-        return isNumber ? value.padStart(columnWidths[h]) : value.padEnd(columnWidths[h]);
-      }).join('  '); // Add explicit 2-space separator
-      return h(Text, { key: i }, rowText);
-    })
-  );
 };
 
 dotenv.config();
@@ -68,58 +26,101 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // ============================================================================
-// DASHBOARD STATE CLASS
+// UI COMPONENTS (STYLED)
+// ============================================================================
+
+// A wrapper that creates a bordered "Card" with a title on the border
+const Section = ({ title, children, color = 'cyan', width = '100%', height }) => {
+  return h(Box, { 
+    flexDirection: 'column', 
+    borderStyle: 'round', 
+    borderColor: color, 
+    paddingX: 1,
+    width: width,
+    height: height,
+    marginLeft: 0,
+    marginRight: 1,
+    marginBottom: 0
+  },
+    h(Box, { marginTop: -1, marginLeft: 1 },
+      h(Text, { color: color, bold: true }, ` ${title} `)
+    ),
+    children
+  );
+};
+
+const Table = ({ data, highlightFn }) => {
+  if (!data || data.length === 0) {
+    return h(Box, { height: 3, justifyContent: 'center', alignItems: 'center' },
+      h(Text, { color: 'gray', italic: true }, 'No data available')
+    );
+  }
+
+  const headers = Object.keys(data[0]);
+  const columnWidths = {};
+
+  // Calculate column widths
+  headers.forEach(header => {
+    columnWidths[header] = Math.max(
+      header.length,
+      ...data.map(row => String(row[header] || '').length)
+    ) + 2; // Add padding
+  });
+
+  // Render Header
+  const headerRow = headers.map(h => {
+    return h.padEnd(columnWidths[h]);
+  }).join(' ');
+
+  return h(Box, { flexDirection: 'column' },
+    h(Box, { borderStyle: 'single', borderTop: false, borderLeft: false, borderRight: false, borderColor: 'gray', marginBottom: 0 },
+      h(Text, { bold: true, color: 'white' }, headerRow)
+    ),
+    ...data.map((row, i) => {
+      // Allow custom coloring of rows based on data
+      const rowColor = highlightFn ? highlightFn(row) : undefined;
+      
+      const rowText = headers.map(header => {
+        const value = row[header] !== undefined && row[header] !== null ? String(row[header]) : '';
+        const isNumber = value && !isNaN(parseFloat(value)) && value.match(/^-?\d+\.?\d*$/);
+        return isNumber ? value.padStart(columnWidths[header]) : value.padEnd(columnWidths[header]);
+      }).join(' ');
+
+      return h(Text, { key: i, color: rowColor }, rowText);
+    })
+  );
+};
+
+// ============================================================================
+// STATE & LOGIC
 // ============================================================================
 
 class DashboardState {
   constructor() {
-    // Balances and equity
     this.hlBalance = null;
     this.hlEquity = null;
     this.pacBalance = null;
     this.pacEquity = null;
-
-    // Positions (Map: symbol -> position)
     this.hlPositions = new Map();
     this.pacPositions = new Map();
-
-    // Orders (Map: orderId -> order)
     this.hlOrders = new Map();
     this.pacOrders = new Map();
-
-    // Recent fills (last 10)
     this.recentFills = [];
     this.maxFills = 10;
-
-    // Recent orders (last 8)
     this.recentOrders = [];
     this.maxOrders = 8;
-
-    // Track seen fill IDs for deduplication (with max size limit)
     this.seenFillIds = new Set();
-    this.maxSeenIds = 1000; // Prevent unbounded growth
-
-    // Track seen order IDs for deduplication (with max size limit)
+    this.maxSeenIds = 1000;
     this.seenOrderIds = new Set();
-
-    // Connection health status
     this.hlConnected = false;
     this.hlReconnecting = false;
     this.pacConnected = false;
     this.pacReconnecting = false;
-
-    // Last successful data fetch timestamps
     this.hlLastFetch = null;
     this.pacLastFetch = null;
-
-    // Error tracking
     this.lastError = null;
     this.errorCount = 0;
-
-    // Dirty flag
     this.dirty = true;
-
-    // Last update timestamp
     this.lastUpdate = Date.now();
   }
 
@@ -136,14 +137,12 @@ class DashboardState {
       pacOrders: new Map(this.pacOrders),
       recentFills: [...this.recentFills],
       recentOrders: [...this.recentOrders],
-      // Connection health
       hlConnected: this.hlConnected,
       hlReconnecting: this.hlReconnecting,
       pacConnected: this.pacConnected,
       pacReconnecting: this.pacReconnecting,
       hlLastFetch: this.hlLastFetch,
       pacLastFetch: this.pacLastFetch,
-      // Error tracking
       lastError: this.lastError,
       errorCount: this.errorCount,
       lastUpdate: this.lastUpdate
@@ -155,154 +154,93 @@ class DashboardState {
     this.lastUpdate = Date.now();
   }
 
-  // Update balances with improved logic
   updateHLBalance(balance, equity) {
-    // Accept null/undefined as valid (not fetched yet)
-    // Accept 0 if we haven't fetched before (initial state)
-    // Reject 0 only if we had a positive value before (likely API glitch)
-    const isValidUpdate =
-      balance !== undefined && equity !== undefined &&
-      (balance > 0 || equity > 0 || this.hlBalance === null);
-
+    const isValidUpdate = balance !== undefined && equity !== undefined && (balance > 0 || equity > 0 || this.hlBalance === null);
     if (isValidUpdate) {
       this.hlBalance = balance;
       this.hlEquity = equity;
       this.hlLastFetch = Date.now();
       this.markDirty();
-      logger.info(`HL balance updated: ${balance} / ${equity}`);
-    } else {
-      logger.warn(`HL balance update rejected (zero values): ${balance} / ${equity}`);
     }
   }
 
   updatePACBalance(balance, equity) {
-    // Same logic as HL balance
-    const isValidUpdate =
-      balance !== undefined && equity !== undefined &&
-      (balance > 0 || equity > 0 || this.pacBalance === null);
-
+    const isValidUpdate = balance !== undefined && equity !== undefined && (balance > 0 || equity > 0 || this.pacBalance === null);
     if (isValidUpdate) {
       this.pacBalance = balance;
       this.pacEquity = equity;
       this.pacLastFetch = Date.now();
       this.markDirty();
-      logger.info(`PAC balance updated: ${balance} / ${equity}`);
-    } else {
-      logger.warn(`PAC balance update rejected (zero values): ${balance} / ${equity}`);
     }
   }
 
-  // Update positions
   updateHLPositions(positions) {
     this.hlPositions.clear();
-    positions.forEach(pos => {
-      this.hlPositions.set(pos.coin, pos);
-    });
+    positions.forEach(pos => this.hlPositions.set(pos.coin, pos));
     this.markDirty();
   }
 
   updatePACPositions(positions) {
     this.pacPositions.clear();
-    positions.forEach(pos => {
-      this.pacPositions.set(pos.symbol, pos);
-    });
+    positions.forEach(pos => this.pacPositions.set(pos.symbol, pos));
     this.markDirty();
   }
 
-  // Update orders
   updateHLOrders(orders) {
     this.hlOrders.clear();
-    orders.forEach(order => {
-      this.hlOrders.set(order.orderId, order);
-    });
+    orders.forEach(order => this.hlOrders.set(order.orderId, order));
     this.markDirty();
   }
 
   updatePACOrders(orders) {
     this.pacOrders.clear();
-    orders.forEach(order => {
-      this.pacOrders.set(order.order_id, order);
-    });
+    orders.forEach(order => this.pacOrders.set(order.order_id, order));
     this.markDirty();
   }
 
-  // Add fill with deduplication and memory protection
   addFill(fill) {
     const fillId = fill.id || fill.tradeId || fill.hash || `${fill.timestamp}-${fill.coin || fill.symbol}`;
-
-    if (this.seenFillIds.has(fillId)) {
-      return; // Already seen
-    }
-
-    // Memory protection: limit Set size
+    if (this.seenFillIds.has(fillId)) return;
     if (this.seenFillIds.size >= this.maxSeenIds) {
-      logger.warn(`Fill ID cache exceeded ${this.maxSeenIds}, clearing oldest entries`);
-      // Clear oldest half when limit reached
       const toRemove = Array.from(this.seenFillIds).slice(0, Math.floor(this.maxSeenIds / 2));
       toRemove.forEach(id => this.seenFillIds.delete(id));
     }
-
     this.seenFillIds.add(fillId);
     this.recentFills.unshift(fill);
-
-    // Keep only maxFills
     if (this.recentFills.length > this.maxFills) {
       const removed = this.recentFills.pop();
       const removedId = removed.id || removed.tradeId || removed.hash || `${removed.timestamp}-${removed.coin || removed.symbol}`;
       this.seenFillIds.delete(removedId);
     }
-
     this.markDirty();
   }
 
-  // Add order to recent orders with deduplication and memory protection
   addRecentOrder(order) {
-    // Create unique ID for this order (prioritize order_id, use created_at consistently for fallback)
-    const orderId = order.orderId || order.order_id ||
-                   `${order.exchange}-${order.symbol}-${order.created_at || order.timestamp}-${order.side}`;
-
-    // Skip if already seen
-    if (this.seenOrderIds.has(orderId)) {
-      return;
-    }
-
-    // Memory protection: limit Set size
+    const orderId = order.orderId || order.order_id || `${order.exchange}-${order.symbol}-${order.created_at || order.timestamp}-${order.side}`;
+    if (this.seenOrderIds.has(orderId)) return;
     if (this.seenOrderIds.size >= this.maxSeenIds) {
-      logger.warn(`Order ID cache exceeded ${this.maxSeenIds}, clearing oldest entries`);
       const toRemove = Array.from(this.seenOrderIds).slice(0, Math.floor(this.maxSeenIds / 2));
       toRemove.forEach(id => this.seenOrderIds.delete(id));
     }
-
     this.seenOrderIds.add(orderId);
     this.recentOrders.unshift(order);
-
-    // Keep only maxOrders
     if (this.recentOrders.length > this.maxOrders) {
       const removed = this.recentOrders.pop();
-      const removedId = removed.orderId || removed.order_id ||
-                       `${removed.exchange}-${removed.symbol}-${removed.timestamp || removed.created_at}-${removed.side}`;
+      const removedId = removed.orderId || removed.order_id || `${removed.exchange}-${removed.symbol}-${removed.timestamp || removed.created_at}-${removed.side}`;
       this.seenOrderIds.delete(removedId);
     }
-
     this.markDirty();
   }
 
-  // Replace recent orders with a fresh snapshot (used for polling to avoid accumulation issues)
   replaceRecentOrders(orders) {
-    // Clear existing orders and deduplication set
     this.recentOrders = [];
     this.seenOrderIds.clear();
-
-    // Add orders in reverse to maintain newest-first order (appendleft behavior)
     for (let i = orders.length - 1; i >= 0; i--) {
       const order = orders[i];
-      const orderId = order.orderId || order.order_id ||
-                     `${order.exchange}-${order.symbol}-${order.created_at || order.timestamp}-${order.side}`;
-
+      const orderId = order.orderId || order.order_id || `${order.exchange}-${order.symbol}-${order.created_at || order.timestamp}-${order.side}`;
       this.seenOrderIds.add(orderId);
       this.recentOrders.unshift(order);
     }
-
     this.markDirty();
   }
 }
@@ -314,14 +252,9 @@ class DashboardState {
 function formatAge(timestamp) {
   const ageMs = Date.now() - timestamp;
   const ageSec = Math.floor(ageMs / 1000);
-
-  if (ageSec < 60) {
-    return `${ageSec}s`;
-  } else if (ageSec < 3600) {
-    return `${Math.floor(ageSec / 60)}m`;
-  } else {
-    return `${Math.floor(ageSec / 3600)}h`;
-  }
+  if (ageSec < 60) return `${ageSec}s`;
+  if (ageSec < 3600) return `${Math.floor(ageSec / 60)}m`;
+  return `${Math.floor(ageSec / 3600)}h`;
 }
 
 function formatTimestamp(timestamp) {
@@ -334,201 +267,123 @@ function formatNumber(num, decimals = 2) {
 }
 
 // ============================================================================
-// INK UI COMPONENTS
+// UI SECTIONS
 // ============================================================================
 
 const Header = ({ lastUpdate, hlConnected, hlReconnecting, pacConnected, pacReconnecting, errorCount }) => {
-  // Connection status indicators
-  const hlStatus = hlReconnecting ? ' 🔄 Reconnecting' :
-                   hlConnected ? ' ✓ Connected' : ' ⏳ Connecting';
-  const pacStatus = pacReconnecting ? ' 🔄 Reconnecting' :
-                    pacConnected ? ' ✓ Connected' : ' ⏳ Connecting';
+  const StatusBadge = ({ label, connected, reconnecting }) => {
+    const color = reconnecting ? 'yellow' : connected ? 'green' : 'red';
+    const icon = reconnecting ? '🔄' : connected ? '●' : '○';
+    return h(Text, { color }, `${icon} ${label} `);
+  };
 
-  const hlColor = hlReconnecting ? 'yellow' :
-                  hlConnected ? 'green' : 'gray';
-  const pacColor = pacReconnecting ? 'yellow' :
-                   pacConnected ? 'green' : 'gray';
-
-  return h(Box, { flexDirection: 'column' },
-    h(Text, { bold: true, color: 'cyan' }, DEBUG_MODE ? 'XEMM Dashboard - Live (DEBUG MODE)' : 'XEMM Dashboard - Live'),
-    h(Box, { flexDirection: 'row' },
-      h(Text, { color: 'gray' }, `Updated: ${formatTimestamp(lastUpdate)}  |  `),
-      h(Text, { color: hlColor }, `HL${hlStatus}`),
-      h(Text, { color: 'gray' }, '  |  '),
-      h(Text, { color: pacColor }, `PAC${pacStatus}`),
-      errorCount > 0 && h(Text, { color: 'red' }, `  |  ⚠️  ${errorCount} errors`)
+  return h(Box, { flexDirection: 'column', marginBottom: 1 },
+    h(Box, { justifyContent: 'space-between', borderStyle: 'double', borderColor: 'blue', paddingX: 1 },
+      h(Text, { bold: true, color: 'blueBright' }, ' XEMM DASHBOARD '),
+      h(Text, { color: 'gray' }, `Last Update: ${formatTimestamp(lastUpdate)}`)
+    ),
+    h(Box, { paddingX: 1, marginTop: 0 },
+      h(StatusBadge, { label: 'Hyperliquid', connected: hlConnected, reconnecting: hlReconnecting }),
+      h(Text, { color: 'gray' }, '| '),
+      h(StatusBadge, { label: 'Pacifica', connected: pacConnected, reconnecting: pacReconnecting }),
+      h(Spacer),
+      errorCount > 0 && h(Text, { color: 'red', bold: true }, `⚠️ Errors: ${errorCount}`)
     )
   );
 };
 
 const BalanceTable = ({ hlBalance, hlEquity, pacBalance, pacEquity }) => {
   const data = [
-    {
-      Exchange: 'Hyperliquid',
-      Available: formatNumber(hlBalance),
-      Equity: formatNumber(hlEquity),
-      Status: hlBalance !== null ? ' ✓' : ' ⏳'
-    },
-    {
-      Exchange: 'Pacifica',
-      Available: formatNumber(pacBalance),
-      Equity: formatNumber(pacEquity),
-      Status: pacBalance !== null ? ' ✓' : ' ⏳'
-    }
+    { Exch: 'HL', Avail: formatNumber(hlBalance), Equity: formatNumber(hlEquity) },
+    { Exch: 'PAC', Avail: formatNumber(pacBalance), Equity: formatNumber(pacEquity) }
   ];
 
-  return h(Box, { flexDirection: 'column' },
-    h(Text, { bold: true, color: 'yellow' }, '\nAccount Balances'),
+  return h(Section, { title: 'Balances', color: 'yellow', width: '40%' },
     h(Table, { data })
   );
 };
 
 const PositionTable = ({ hlPositions, pacPositions, symbols }) => {
-  const data = [];
-
-  symbols.forEach(symbol => {
+  const data = symbols.map(symbol => {
     const hlPos = hlPositions.get(symbol);
     const pacPos = pacPositions.get(symbol);
-
     const hlSize = hlPos ? (hlPos.side === 'long' ? hlPos.size : -hlPos.size) : 0;
-    // Note: Pacifica connector correctly transforms API response ('bid'/'ask') to 'long'/'short'
-    // See pacifica.js:690 for transformation logic
     const pacSize = pacPos ? (pacPos.side === 'long' ? parseFloat(pacPos.amount) : -parseFloat(pacPos.amount)) : 0;
     const netPos = hlSize + pacSize;
-
     const isBalanced = Math.abs(netPos) < 0.01;
 
-    data.push({
-      Symbol: symbol,
-      'HL Pos': formatNumber(hlSize, 4),
-      'PAC Pos': formatNumber(pacSize, 4),
-      'Net Pos': formatNumber(netPos, 4),
-      Status: isBalanced ? ' ✓ BALANCED' : ' ⚠️  IMBALANCED'
-    });
+    return {
+      Sym: symbol,
+      'HL': formatNumber(hlSize, 2),
+      'PAC': formatNumber(pacSize, 2),
+      'Net': formatNumber(netPos, 2),
+      Stat: isBalanced ? 'OK' : 'IMBAL'
+    };
   });
 
-  return h(Box, { flexDirection: 'column' },
-    h(Text, { bold: true, color: 'green' }, '\nNet Positions'),
-    h(Table, { data })
+  const highlightFn = (row) => row.Stat === 'IMBAL' ? 'red' : 'green';
+
+  return h(Section, { title: 'Net Positions', color: 'green', width: '60%' },
+    h(Table, { data, highlightFn })
   );
 };
 
 const OpenOrdersTable = ({ hlOrders, pacOrders }) => {
   const data = [];
+  
+  hlOrders.forEach(o => data.push({
+    Ex: 'HL', Sym: o.coin, Side: o.side.toUpperCase(), Px: formatNumber(o.limitPrice), Sz: formatNumber(o.size), Age: formatAge(o.timestamp)
+  }));
+  
+  pacOrders.forEach(o => data.push({
+    Ex: 'PAC', Sym: o.symbol || '-', Side: (o.side || '').toUpperCase(), Px: formatNumber(o.initial_price || o.price), Sz: formatNumber(o.initial_amount || o.amount), Age: formatAge(o.created_at || o.timestamp)
+  }));
 
-  // Add HL orders
-  hlOrders.forEach((order) => {
-    data.push({
-      Exchange: 'HL',
-      Symbol: order.coin,
-      Side: order.side.toUpperCase(),
-      Price: formatNumber(order.limitPrice, 4),
-      Size: formatNumber(order.size, 4),
-      Age: formatAge(order.timestamp)
-    });
-  });
+  data.sort((a, b) => parseInt(a.Age) - parseInt(b.Age));
+  const displayData = data.slice(0, 5); // Show max 5 open orders
 
-  // Add PAC orders
-  pacOrders.forEach((order) => {
-    data.push({
-      Exchange: 'PAC',
-      Symbol: order.symbol || '-',
-      Side: (order.side || '').toUpperCase(),
-      Price: formatNumber(parseFloat(order.initial_price || order.price || 0), 4),
-      Size: formatNumber(parseFloat(order.initial_amount || order.amount || order.size || 0), 4),
-      Age: formatAge(order.created_at || order.timestamp || Date.now())
-    });
-  });
-
-  // Sort by age (newest first)
-  data.sort((a, b) => {
-    const ageA = parseInt(a.Age);
-    const ageB = parseInt(b.Age);
-    return ageA - ageB;
-  });
-
-  // Pad with empty rows to maintain consistent height (minimum 3 rows)
-  const minRows = 3;
-  const displayData = data.slice(0, 10);
-  while (displayData.length < minRows) {
-    displayData.push({
-      Exchange: '',
-      Symbol: '',
-      Side: '',
-      Price: '',
-      Size: '',
-      Age: ''
-    });
-  }
-
-  return h(Box, { flexDirection: 'column' },
-    h(Text, { bold: true, color: 'blue' }, `\nOpen Orders (${data.length})`),
+  return h(Section, { title: `Open Orders (${data.length})`, color: 'blue' },
     h(Table, { data: displayData })
   );
 };
 
 const RecentOrdersTable = ({ recentOrders }) => {
-  // Data is already sorted by the snapshot approach (newest first)
-  const data = recentOrders.slice(0, 8).map(order => ({
-    Time: formatTimestamp(order.timestamp || order.created_at),
-    Exchange: order.exchange,
-    Symbol: order.coin || order.symbol,
-    Side: (order.side || '').toUpperCase(),
-    Size: formatNumber(order.size || order.amount, 4),
-    Status: order.status || 'FILLED'
+  const data = recentOrders.slice(0, 5).map(o => ({
+    Time: formatTimestamp(o.timestamp || o.created_at),
+    Ex: o.exchange,
+    Sym: o.coin || o.symbol,
+    Side: (o.side || '').toUpperCase(),
+    Sz: formatNumber(o.size || o.amount, 2),
+    Stat: o.status || 'FILLED'
   }));
 
-  // Pad with empty rows to maintain consistent height (always 8 rows)
-  while (data.length < 8) {
-    data.push({
-      Time: '',
-      Exchange: '',
-      Symbol: '',
-      Side: '',
-      Size: '',
-      Status: ''
-    });
-  }
+  const highlightFn = (row) => row.Stat === 'CANCELLED' ? 'gray' : 'white';
 
-  return h(Box, { flexDirection: 'column' },
-    h(Text, { bold: true, color: 'magenta' }, '\nRecent Orders (Last 8)'),
-    h(Table, { data })
+  return h(Section, { title: 'Recent Activity', color: 'magenta' },
+    h(Table, { data, highlightFn })
   );
 };
 
 const RecentFillsTable = ({ recentFills }) => {
-  const data = recentFills.slice(0, 10).map(fill => ({
-    Time: formatTimestamp(fill.timestamp || fill.created_at),
-    Exchange: fill.exchange,
-    Symbol: fill.coin || fill.symbol,
-    Side: (fill.side || '').toUpperCase(),
-    Price: formatNumber(fill.price, 4),
-    Size: formatNumber(fill.size || fill.amount, 4),
-    PnL: formatNumber(fill.closedPnl || fill.pnl || 0, 2)
+  const data = recentFills.slice(0, 5).map(f => ({
+    Time: formatTimestamp(f.timestamp || f.created_at),
+    Ex: f.exchange,
+    Sym: f.coin || f.symbol,
+    Side: (f.side || '').toUpperCase(),
+    Px: formatNumber(f.price),
+    Sz: formatNumber(f.size || f.amount, 2),
+    PnL: formatNumber(f.closedPnl || f.pnl || 0, 2)
   }));
 
-  // Pad with empty rows to maintain consistent height (always 10 rows)
-  while (data.length < 10) {
-    data.push({
-      Time: '',
-      Exchange: '',
-      Symbol: '',
-      Side: '',
-      Price: '',
-      Size: '',
-      PnL: ''
-    });
-  }
+  const highlightFn = (row) => parseFloat(row.PnL) > 0 ? 'green' : parseFloat(row.PnL) < 0 ? 'red' : undefined;
 
-  return h(Box, { flexDirection: 'column' },
-    h(Text, { bold: true, color: 'cyan' }, '\nRecent Fills (Last 10)'),
-    h(Table, { data })
+  return h(Section, { title: 'Fills & PnL', color: 'cyan' },
+    h(Table, { data, highlightFn })
   );
 };
 
-// Main Dashboard Component
 const DashboardUI = ({ snapshot, symbols }) => {
-  return h(Box, { flexDirection: 'column' },
+  return h(Box, { flexDirection: 'column', padding: 1 },
     h(Header, {
       lastUpdate: snapshot.lastUpdate,
       hlConnected: snapshot.hlConnected,
@@ -537,497 +392,233 @@ const DashboardUI = ({ snapshot, symbols }) => {
       pacReconnecting: snapshot.pacReconnecting,
       errorCount: snapshot.errorCount
     }),
-    h(BalanceTable, {
-      hlBalance: snapshot.hlBalance,
-      hlEquity: snapshot.hlEquity,
-      pacBalance: snapshot.pacBalance,
-      pacEquity: snapshot.pacEquity
-    }),
-    h(PositionTable, {
-      hlPositions: snapshot.hlPositions,
-      pacPositions: snapshot.pacPositions,
-      symbols: symbols
-    }),
-    h(OpenOrdersTable, {
-      hlOrders: snapshot.hlOrders,
-      pacOrders: snapshot.pacOrders
-    }),
-    h(RecentOrdersTable, { recentOrders: snapshot.recentOrders }),
-    h(RecentFillsTable, { recentFills: snapshot.recentFills })
+    
+    // Grid Layout: Balances (Left) + Positions (Right)
+    h(Box, { flexDirection: 'row', width: '100%', marginBottom: 1 },
+      h(BalanceTable, {
+        hlBalance: snapshot.hlBalance,
+        hlEquity: snapshot.hlEquity,
+        pacBalance: snapshot.pacBalance,
+        pacEquity: snapshot.pacEquity
+      }),
+      h(PositionTable, {
+        hlPositions: snapshot.hlPositions,
+        pacPositions: snapshot.pacPositions,
+        symbols: symbols
+      })
+    ),
+
+    h(OpenOrdersTable, { hlOrders: snapshot.hlOrders, pacOrders: snapshot.pacOrders }),
+    
+    // Grid Layout: Recent Orders + Fills
+    h(Box, { flexDirection: 'column' },
+      h(RecentOrdersTable, { recentOrders: snapshot.recentOrders }),
+      h(RecentFillsTable, { recentFills: snapshot.recentFills })
+    )
   );
 };
 
 // ============================================================================
-// DASHBOARD CONTROLLER CLASS
+// CONTROLLER
 // ============================================================================
 
 class Dashboard {
   constructor(configPath) {
-    // Validate config file exists
-    if (!existsSync(configPath)) {
-      throw new Error(`Configuration file not found: ${configPath}`);
-    }
-
-    // Load and validate configuration
-    try {
-      this.config = JSON.parse(readFileSync(configPath, 'utf-8'));
-    } catch (error) {
-      throw new Error(`Failed to parse configuration file: ${error.message}`);
-    }
-
-    // Validate required config fields
-    if (!this.config.symbols || !Array.isArray(this.config.symbols) || this.config.symbols.length === 0) {
-      throw new Error('Configuration must contain a non-empty "symbols" array');
-    }
-
-    logger.info(`Loaded config: ${this.config.symbols.length} symbols`);
-
+    if (!existsSync(configPath)) throw new Error(`Config not found: ${configPath}`);
+    this.config = JSON.parse(readFileSync(configPath, 'utf-8'));
     this.state = new DashboardState();
-
-    // Connectors
     this.hlConnector = null;
     this.pacConnector = null;
-
-    // Polling intervals
     this.pollingTasks = [];
-
-    // Shutdown flag
     this.shutdown = false;
   }
 
   async initialize() {
-    // Suppress console output to prevent dashboard movement (unless DEBUG mode)
     if (!DEBUG_MODE) {
-      const originalLog = console.log;
-      const originalError = console.error;
-      const originalWarn = console.warn;
-
       console.log = () => {};
       console.error = () => {};
       console.warn = () => {};
     }
 
-    try {
-      logger.info('Initializing connectors...');
+    this.hlConnector = new HyperliquidConnector({
+      wallet: process.env.HL_WALLET,
+      privateKey: process.env.HL_PRIVATE_KEY,
+      silent: !DEBUG_MODE
+    });
 
-      // Validate environment variables
-      if (!process.env.HL_WALLET || !process.env.HL_PRIVATE_KEY) {
-        throw new Error('Missing Hyperliquid credentials (HL_WALLET, HL_PRIVATE_KEY)');
-      }
-      if (!process.env.SOL_WALLET || !process.env.API_PUBLIC || !process.env.API_PRIVATE) {
-        throw new Error('Missing Pacifica credentials (SOL_WALLET, API_PUBLIC, API_PRIVATE)');
-      }
+    this.pacConnector = new PacificaConnector({
+      wallet: process.env.SOL_WALLET,
+      apiPublic: process.env.API_PUBLIC,
+      apiPrivate: process.env.API_PRIVATE,
+      silent: !DEBUG_MODE
+    });
 
-      // Initialize Hyperliquid connector
-      this.hlConnector = new HyperliquidConnector({
-        wallet: process.env.HL_WALLET,
-        privateKey: process.env.HL_PRIVATE_KEY,
-        silent: !DEBUG_MODE
-      });
-
-      // Initialize Pacifica connector
-      this.pacConnector = new PacificaConnector({
-        wallet: process.env.SOL_WALLET,
-        apiPublic: process.env.API_PUBLIC,
-        apiPrivate: process.env.API_PRIVATE,
-        silent: !DEBUG_MODE
-      });
-
-      // Set up connection event listeners
-      this.setupConnectionListeners();
-
-      // Connect to exchanges (WebSocket)
-      await this.hlConnector.connect();
-      this.state.hlConnected = true;
-      this.state.markDirty();
-
-      await this.pacConnector.connect();
-      this.state.pacConnected = true;
-      this.state.markDirty();
-
-      logger.info('Connectors initialized successfully');
-    } catch (error) {
-      logger.error('Initialization error:', error.message);
-      this.state.lastError = error.message;
-      this.state.errorCount++;
-      this.state.markDirty();
-      throw error;
-    }
+    this.setupConnectionListeners();
+    await this.hlConnector.connect();
+    await this.pacConnector.connect();
+    this.state.hlConnected = true;
+    this.state.pacConnected = true;
   }
 
   setupConnectionListeners() {
-    // Hyperliquid connection events
-    this.hlConnector.on('connected', () => {
-      logger.info('HL connected');
-      this.state.hlConnected = true;
-      this.state.hlReconnecting = false;
-      this.state.markDirty();
-    });
-
-    this.hlConnector.on('disconnected', () => {
-      logger.warn('HL disconnected');
-      this.state.hlConnected = false;
-      this.state.markDirty();
-    });
-
-    this.hlConnector.on('error', (error) => {
-      logger.error('HL error:', error.message);
-      this.state.lastError = `HL: ${error.message}`;
-      this.state.errorCount++;
-      this.state.markDirty();
-    });
-
-    // Pacifica connection events
-    this.pacConnector.on('connected', () => {
-      logger.info('PAC connected');
-      this.state.pacConnected = true;
-      this.state.pacReconnecting = false;
-      this.state.markDirty();
-    });
-
-    this.pacConnector.on('disconnected', () => {
-      logger.warn('PAC disconnected');
-      this.state.pacConnected = false;
-      this.state.markDirty();
-    });
-
-    this.pacConnector.on('error', (error) => {
-      logger.error('PAC error:', error.message);
-      this.state.lastError = `PAC: ${error.message}`;
-      this.state.errorCount++;
-      this.state.markDirty();
-    });
+    this.hlConnector.on('connected', () => { this.state.hlConnected = true; this.state.hlReconnecting = false; this.state.markDirty(); });
+    this.hlConnector.on('disconnected', () => { this.state.hlConnected = false; this.state.markDirty(); });
+    this.hlConnector.on('error', (e) => { this.state.lastError = `HL: ${e.message}`; this.state.errorCount++; this.state.markDirty(); });
+    this.pacConnector.on('connected', () => { this.state.pacConnected = true; this.state.pacReconnecting = false; this.state.markDirty(); });
+    this.pacConnector.on('disconnected', () => { this.state.pacConnected = false; this.state.markDirty(); });
+    this.pacConnector.on('error', (e) => { this.state.lastError = `PAC: ${e.message}`; this.state.errorCount++; this.state.markDirty(); });
   }
 
   async setupAndStart() {
-    // Set up WebSocket event handlers
-    this.setupEventHandlers();
-
-    // Bootstrap initial data
-    await this.bootstrapData();
-
-    // Start polling tasks
-    this.startPolling();
-  }
-
-  setupEventHandlers() {
-    // Pacifica WebSocket events - real-time order and fill updates
-    this.pacConnector.on('fill', (data) => {
-      // Only add to fills (don't add to recent orders - fills are shown in Recent Fills section)
-      this.state.addFill({
-        exchange: 'PAC',
-        symbol: data.symbol,
-        side: data.tradeSide,
-        price: data.price,
-        amount: data.amount,
-        timestamp: data.timestamp,
-        pnl: data.pnl || 0
-      });
-    });
-
-    this.pacConnector.on('orderUpdate', (data) => {
-      // Update open orders map based on order status
-      if (data.orderStatus === 'open' || data.orderStatus === 'partially_filled') {
-        // Add/update open order
-        this.state.pacOrders.set(data.orderId, {
-          order_id: data.orderId,
-          client_order_id: data.clientOrderId,
-          symbol: data.symbol,
-          side: data.side,
-          price: data.initialPrice,
-          initial_price: data.initialPrice,
-          initial_amount: data.amount,
-          filled_amount: data.filledAmount,
-          order_status: data.orderStatus,
-          order_type: data.orderType,
-          created_at: data.createdAt,
-          updated_at: data.updatedAt
-        });
+    // Pacifica Event Listeners
+    this.pacConnector.on('fill', (d) => this.state.addFill({ exchange: 'PAC', symbol: d.symbol, side: d.tradeSide, price: d.price, amount: d.amount, timestamp: d.timestamp, pnl: d.pnl || 0 }));
+    
+    this.pacConnector.on('orderUpdate', (d) => {
+      if (d.orderStatus === 'open' || d.orderStatus === 'partially_filled') {
+        this.state.pacOrders.set(d.orderId, { order_id: d.orderId, symbol: d.symbol, side: d.side, price: d.initialPrice, initial_amount: d.amount, created_at: d.createdAt });
       } else {
-        // Remove from open orders if filled/cancelled
-        this.state.pacOrders.delete(data.orderId);
-
-        // Add to recent orders for cancelled/rejected orders
-        if (data.orderStatus === 'cancelled' || data.orderStatus === 'rejected') {
-          this.state.addRecentOrder({
-            exchange: 'PAC',
-            symbol: data.symbol,
-            side: data.side,
-            amount: data.amount,
-            status: data.orderStatus.toUpperCase(),
-            timestamp: data.updatedAt,
-            created_at: data.createdAt,
-            orderId: data.orderId
-          });
+        this.state.pacOrders.delete(d.orderId);
+        if (d.orderStatus === 'cancelled' || d.orderStatus === 'rejected') {
+          this.state.addRecentOrder({ exchange: 'PAC', symbol: d.symbol, side: d.side, amount: d.amount, status: d.orderStatus.toUpperCase(), timestamp: d.updatedAt, orderId: d.orderId });
         }
       }
       this.state.markDirty();
     });
+    
+    this.pacConnector.on('orderFilled', (d) => { this.state.pacOrders.delete(d.orderId); this.state.markDirty(); });
 
-    this.pacConnector.on('orderFilled', (data) => {
-      // Remove from open orders
-      this.state.pacOrders.delete(data.orderId);
-
-      // Don't add filled orders to recent orders (they're in Recent Fills)
-      this.state.markDirty();
+    // New PAC Listeners for Account Info & Positions
+    this.pacConnector.on('accountInfo', (info) => {
+      this.state.updatePACBalance(info.availableToSpend, info.equity);
     });
-  }
 
-  async bootstrapData() {
+    this.pacConnector.on('accountPositions', (positions) => {
+      this.state.updatePACPositions(positions);
+    });
+
+    // Hyperliquid Event Listeners
+    this.hlConnector.on('userState', (state) => {
+      this.state.updateHLBalance(state.balance.withdrawable, state.balance.accountValue);
+      this.state.updateHLPositions(state.positions);
+      // userState update doesn't include open orders list directly in the same format, 
+      // but HL clearinghouseState usually implies we might want to poll open orders separately 
+      // or assume the WS poller might be extended. 
+      // For now, let's keep polling orders via REST slowly, or we could add openOrders to the WS poll if we wanted.
+      // Actually, getUserState REST returns positions. requestClearinghouseStateWs returns positions.
+      // So positions are covered.
+    });
+
+    // Initial Data Fetch
+    await this.pollHLData();
+    await this.pollPACData();
+
+    // Start Subscriptions
     try {
-      logger.info('Bootstrapping initial data...');
-
-      // Fetch initial HL data
-      await this.pollHLData();
-
-      // Fetch initial PAC data
-      await this.pollPACData();
-
-      // Subscribe to Pacifica WebSocket order updates (real-time)
       await this.pacConnector.subscribeOrderUpdates(process.env.SOL_WALLET);
-
-      logger.info('Bootstrap complete');
-    } catch (error) {
-      logger.error('Bootstrap error:', error.message);
-      this.state.lastError = `Bootstrap: ${error.message}`;
-      this.state.errorCount++;
-      this.state.markDirty();
+      await this.pacConnector.subscribeAccountInfo(process.env.SOL_WALLET);
+      await this.pacConnector.subscribeAccountPositions(process.env.SOL_WALLET);
+    } catch (e) {
+      console.error('[Dashboard] Failed to subscribe PAC channels:', e.message);
     }
+
+    // Start HL WS Polling (Fast)
+    this.hlConnector.startUserPollingWs(2000, process.env.HL_WALLET);
+
+    // Safety Net Polling (Slow)
+    this.pollingTasks.push(setInterval(() => !this.shutdown && this.pollHLData(), 60000));
+    this.pollingTasks.push(setInterval(() => !this.shutdown && this.pollPACData(), 60000));
   }
 
   async pollHLData() {
     try {
-      // Fetch user state (balance + positions)
       const userState = await this.hlConnector.getUserState();
-
-      // Update balance
-      this.state.updateHLBalance(
-        userState.balance.withdrawable,
-        userState.balance.accountValue
-      );
-
-      // Update positions
+      this.state.updateHLBalance(userState.balance.withdrawable, userState.balance.accountValue);
       this.state.updateHLPositions(userState.positions);
-
-      // Fetch open orders
       const orders = await this.hlConnector.getOpenOrders();
       this.state.updateHLOrders(orders);
-
-      // Fetch recent fills
-      const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
-      const fills = await this.hlConnector.getUserFills(null, oneDayAgo);
-
-      // Add new fills (don't add to recent orders - fills are shown in Recent Fills section)
-      fills.forEach(fill => {
-        this.state.addFill({
-          ...fill,
-          exchange: 'HL'
-        });
-      });
-
-      logger.log('HL data polled successfully');
-    } catch (error) {
-      logger.error('Error polling HL data:', error.message);
-      this.state.lastError = `HL Poll: ${error.message}`;
-      this.state.errorCount++;
-      this.state.markDirty();
+      const fills = await this.hlConnector.getUserFills(null, Date.now() - 86400000);
+      fills.forEach(f => this.state.addFill({ ...f, exchange: 'HL' }));
+    } catch (e) {
+      this.state.lastError = `HL Poll: ${e.message}`; this.state.errorCount++; this.state.markDirty();
     }
   }
 
   async pollPACData() {
     try {
-      // Fetch account balance via WebSocket
       const balanceData = await this.pacConnector.getBalance();
-
-      // Update balance (using correct field names from Pacifica connector)
-      const available = balanceData.availableToSpend || balanceData.balance || 0;
-      const equity = balanceData.accountEquity || 0;
-
-      this.state.updatePACBalance(available, equity);
-
-      // Fetch positions
+      this.state.updatePACBalance(balanceData.availableToSpend || balanceData.balance || 0, balanceData.accountEquity || 0);
       const positions = await this.pacConnector.getPositions();
-
-      // Update positions
       this.state.updatePACPositions(positions);
-
-      // Fetch open orders (requestOrderStatusRest returns data array directly)
       const pacOrders = await this.pacConnector.requestOrderStatusRest(process.env.SOL_WALLET);
-      if (Array.isArray(pacOrders)) {
-        this.state.updatePACOrders(pacOrders);
-      }
-
-      // Fetch recent fills from order history (returns data array directly)
-      // Optimized: Fetch 50 orders (reduced from 200 to improve performance)
+      if (Array.isArray(pacOrders)) this.state.updatePACOrders(pacOrders);
+      
       const orderHistory = await this.pacConnector.requestOrderHistoryRest(process.env.SOL_WALLET, 50);
-
       if (Array.isArray(orderHistory)) {
-        // First, separate filled orders and cancelled/rejected orders
-        const filledOrders = [];
-        const cancelledOrders = [];
-
+        const cancelled = [];
         orderHistory.forEach(order => {
-          if (parseFloat(order.filled_amount || 0) > 0) {
-            filledOrders.push(order);
-          }
-          if (order.order_status === 'cancelled' || order.order_status === 'rejected') {
-            cancelledOrders.push(order);
-          }
+            if (parseFloat(order.filled_amount || 0) > 0) {
+                 this.state.addFill({ id: order.order_id, exchange: 'PAC', symbol: order.symbol, side: order.side, price: parseFloat(order.average_filled_price || order.initial_price), amount: parseFloat(order.filled_amount), timestamp: order.updated_at, pnl: 0 });
+            }
+            if (order.order_status === 'cancelled' || order.order_status === 'rejected') cancelled.push(order);
         });
-
-        // Sort cancelled orders by updated_at DESC (newest first)
-        cancelledOrders.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
-
-        // Add filled orders to fills
-        filledOrders.forEach(order => {
-          this.state.addFill({
-            id: order.order_id,
-            exchange: 'PAC',
-            symbol: order.symbol,
-            side: order.side,
-            price: parseFloat(order.average_filled_price || order.initial_price),
-            amount: parseFloat(order.filled_amount),
-            timestamp: order.updated_at,
-            pnl: 0
-          });
-        });
-
-        // SNAPSHOT APPROACH: Replace recent orders with the latest 8 (don't accumulate)
-        // This ensures we always show the TRUE latest 8 orders from the API
-        const recentOrdersSnapshot = cancelledOrders.slice(0, 8).map(order => ({
-          exchange: 'PAC',
-          symbol: order.symbol,
-          side: order.side,
-          amount: parseFloat(order.amount || order.initial_amount || 0),
-          status: order.order_status.toUpperCase(),
-          timestamp: order.updated_at,
-          created_at: order.created_at,
-          order_id: order.order_id
-        }));
-
-        // Replace the entire recent orders list with this snapshot
-        this.state.replaceRecentOrders(recentOrdersSnapshot);
+        cancelled.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+        this.state.replaceRecentOrders(cancelled.slice(0, 8).map(o => ({ exchange: 'PAC', symbol: o.symbol, side: o.side, amount: parseFloat(o.amount || o.initial_amount || 0), status: o.order_status.toUpperCase(), timestamp: o.updated_at, order_id: o.order_id })));
       }
-
-      logger.log('PAC data polled successfully');
-    } catch (error) {
-      logger.error('Error polling PAC data:', error.message);
-      this.state.lastError = `PAC Poll: ${error.message}`;
-      this.state.errorCount++;
-      this.state.markDirty();
+    } catch (e) {
+      this.state.lastError = `PAC Poll: ${e.message}`; this.state.errorCount++; this.state.markDirty();
     }
   }
 
-  startPolling() {
-    // Poll HL data every 30 seconds (WebSocket not available for user data)
-    this.pollingTasks.push(
-      setInterval(() => {
-        if (!this.shutdown) {
-          this.pollHLData();
-        }
-      }, 30000)
-    );
-
-    // Poll PAC data every 15 seconds (faster backup to catch orders during WebSocket delays)
-    this.pollingTasks.push(
-      setInterval(() => {
-        if (!this.shutdown) {
-          this.pollPACData();
-        }
-      }, 15000)
-    );
-  }
-
-  stopPolling() {
-    this.pollingTasks.forEach(task => clearInterval(task));
-    this.pollingTasks = [];
-  }
+  stopPolling() { this.pollingTasks.forEach(clearInterval); }
 
   async cleanup() {
     this.shutdown = true;
     this.stopPolling();
-
     if (this.hlConnector) {
-      this.hlConnector.disconnect();
+        this.hlConnector.stopUserPollingWs();
+        this.hlConnector.disconnect();
     }
-
-    if (this.pacConnector) {
-      this.pacConnector.disconnect();
-    }
+    if (this.pacConnector) this.pacConnector.disconnect();
   }
 }
 
 // ============================================================================
-// MAIN ENTRY POINT
+// MAIN ENTRY
 // ============================================================================
 
 async function main() {
   const configPath = join(__dirname, 'dashboard', 'config.json');
-
   try {
-    // Create and initialize dashboard
-    logger.info('Starting XEMM Dashboard...');
     const dashboard = new Dashboard(configPath);
-
     await dashboard.initialize();
     await dashboard.setupAndStart();
 
-    logger.info('Dashboard initialized, starting UI...');
-
-    // Create a React component that polls the state
     const App = () => {
       const [snapshot, setSnapshot] = useState(dashboard.state.getSnapshot());
-
       useEffect(() => {
-        // Update UI every 2 seconds if state is dirty (reduces flashing and movement)
-        const interval = setInterval(() => {
-          if (dashboard.state.dirty) {
-            setSnapshot(dashboard.state.getSnapshot());
-          }
-        }, 2000);
-
+        const interval = setInterval(() => dashboard.state.dirty && setSnapshot(dashboard.state.getSnapshot()), 1000);
         return () => clearInterval(interval);
       }, []);
-
       return h(DashboardUI, { snapshot, symbols: dashboard.config.symbols });
     };
 
-    // Render the UI with patchConsole disabled to prevent output interference
     const { unmount } = render(h(App), { patchConsole: false });
-
-    logger.info('Dashboard running. Press Ctrl+C to exit.');
-
-    // Handle graceful shutdown
+    
     const handleShutdown = async () => {
-      logger.info('Shutting down dashboard...');
       unmount();
       await dashboard.cleanup();
-      logger.info('Dashboard stopped.');
       process.exit(0);
     };
-
     process.on('SIGINT', handleShutdown);
     process.on('SIGTERM', handleShutdown);
 
   } catch (error) {
-    logger.error('Fatal error:', error.message);
-    if (DEBUG_MODE) {
-      console.error(error.stack);
-    }
+    console.error('Fatal error:', error.message);
     process.exit(1);
   }
 }
 
-// Run if executed directly
-const isMainModule = import.meta.url === `file:///${__filename.replace(/\\/g, '/')}` ||
-                     import.meta.url.endsWith('/dashboard.js') ||
-                     import.meta.url.endsWith('\\dashboard.js');
-
-if (isMainModule) {
-  main().catch((error) => {
-    console.error('[Dashboard] Fatal error:', error);
-    process.exit(1);
-  });
-}
+const isMainModule = import.meta.url === `file:///${__filename.replace(/\\/g, '/')}`;
+if (isMainModule) main().catch(console.error);
 
 export default Dashboard;
