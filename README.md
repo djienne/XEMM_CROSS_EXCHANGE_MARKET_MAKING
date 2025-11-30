@@ -74,6 +74,30 @@ All methods deduplicate via shared HashSet to ensure only one hedge executes per
 - REST API positions (clearinghouse state for position verification)
 - EIP-712 authenticated trading (market orders)
 - Automatic slippage protection
+- **WebSocket trading for hedges (default)** – Hedge market orders are sent as signed `post` actions over the Hyperliquid WebSocket for minimal latency, with REST fallback on error.
+
+### Hedge Execution Architecture
+
+This development branch introduces a low-latency, queue-based hedge pipeline and WebSocket-based Hyperliquid execution:
+
+- **Hedge event queue (non-blocking)**  
+  - All fill-detection layers (`FillDetectionService`, `RestFillDetectionService`, `PositionMonitorService`) act as **producers** and push `HedgeEvent`s into an unbounded Tokio `mpsc` channel.  
+  - Producers never block when enqueuing, so fill detection is not slowed down by hedge execution.
+
+- **Dedicated hedge executor task**  
+  - `HedgeService` runs in its own async task and acts as a **single consumer** of the hedge event queue.  
+  - It awaits `hedge_rx.recv().await`, so as soon as an event arrives, the hedge flow starts; there is no polling interval.
+
+- **WebSocket-first Hyperliquid hedging**  
+  - On startup, `HedgeService` establishes a dedicated Hyperliquid trading WebSocket connection and keeps it alive for hedging.  
+  - Hedge orders are built and signed once (shared logic), then wrapped in a WS `post` request (`type: "action"`) and sent over the hot WebSocket.
+  - WS responses are parsed into the same `OrderResponse` type as REST, so the downstream profit and verification logic is unchanged.
+  - If WS execution fails for a given hedge (connection error or WS-level error), the bot **falls back to REST** for that hedge and logs the reason.
+
+- **Config toggle: WS vs REST**  
+  - `Config.hyperliquid_use_ws_for_hedge` (default: `true`) controls the execution path:  
+    - `true` → use WebSocket for hedging, with REST fallback on error.  
+    - `false` → use REST-only hedging (original behavior).
 
 ### Performance & Reliability
 - ✅ **Multi-source Orderbook** - WebSocket primary, REST API fallback
@@ -221,7 +245,9 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 |-----------|---------|-------------|
 | `symbol` | "SOL" | Trading symbol (must exist on both exchanges) |
 | `reconnect_attempts` | 5 | Number of WebSocket reconnection attempts with exponential backoff |
+| `agg_level` | 1 | Orderbook aggregation level (1, 2, 5, 10, 100, 1000) |
 | `ping_interval_secs` | 15 | WebSocket ping interval in seconds (max 30s) |
+| `low_latency_mode` | false | Low-latency mode: minimal logging and processing |
 | `pacifica_maker_fee_bps` | 1.5 | Pacifica maker fee in basis points |
 | `hyperliquid_taker_fee_bps` | 4.0 | Hyperliquid taker fee in basis points |
 | `profit_rate_bps` | 15.0 | Target profit in basis points (0.15%), should overcome fees, slippage, and latency |
@@ -229,6 +255,7 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 | `profit_cancel_threshold_bps` | 3.0 | Cancel if profit deviates ±3 bps |
 | `order_refresh_interval_secs` | 60 | Auto-cancel orders older than 60s |
 | `hyperliquid_slippage` | 0.05 | Maximum slippage for market orders (5%) |
+| `hyperliquid_use_ws_for_hedge` | true | Use WebSocket for hedge execution (faster) vs REST |
 | `pacifica_rest_poll_interval_secs` | 2 | REST API fallback polling interval in seconds |
 
 ## Trading Workflow
@@ -428,6 +455,30 @@ python dashboard.py
 ```
 
 See `standalone-utils/README.md` for detailed documentation, configuration options, and troubleshooting.
+
+## Web Dashboard
+
+The `dashboard_js/` directory contains a Node.js web dashboard for remote monitoring and control of the bot.
+
+### Features
+- **Real-time Status** - Monitor bot status (Running/Stopped) with accurate process detection
+- **Remote Control** - Start, stop, and deploy bot from your browser
+- **Live Logs** - Auto-refreshing log viewer with ANSI color support
+- **Trade History** - View recent trades with PnL statistics
+- **Configuration** - Display current bot configuration
+
+### Quick Setup
+
+```bash
+cd dashboard_js
+npm install
+node server.js
+# Open http://localhost:3000 in your browser
+```
+
+The dashboard connects to your remote server via SSH to execute commands and fetch data. Configure the remote server details in `server.js`.
+
+See `dashboard_js/README.md` for detailed documentation, API endpoints, and troubleshooting.
 
 ## Running on Linux/AWS VPS
 

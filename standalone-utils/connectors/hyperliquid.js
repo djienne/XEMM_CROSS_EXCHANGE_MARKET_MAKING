@@ -472,16 +472,85 @@ class HyperliquidConnector extends EventEmitter {
   }
 
   /**
-   * Poll orderbook via WebSocket
-   * Uses a shared polling loop for all symbols to respect rate limits
+   * Start polling user state via WebSocket (more efficient than REST)
+   * @param {number} intervalMs - Polling interval in ms (default 1000)
+   * @param {string} user - User address
    */
-  startWebSocketPolling(coin) {
-    // Don't start individual polling loops
-    // Polling is handled by the global polling loop started in subscribeOrderbook
+  startUserPollingWs(intervalMs = 1000, user = null) {
+    if (this.userPollTimer) return;
+    
+    user = user || this.wallet;
+    if (!user) {
+      console.error('[Hyperliquid] Cannot start WS user polling: No user provided');
+      return;
+    }
+
+    console.log(`[Hyperliquid] Starting WS user polling for ${user} (every ${intervalMs}ms)`);
+    
+    this.userPollTimer = setInterval(async () => {
+      if (!this.connected || this.useRestFallback) return;
+
+      try {
+        // Request state via WS (request-response)
+        const responsePayload = await this.requestClearinghouseStateWs(user);
+        
+        // The payload usually contains the state directly, or wrapped in a 'data' property
+        if (responsePayload) {
+            let data = responsePayload;
+            
+            // Check if wrapped (e.g. { type: 'clearinghouseState', data: {...} })
+            if (data.data && (data.type === 'clearinghouseState' || !data.assetPositions)) {
+                data = data.data;
+            }
+            
+            // Normalize data similar to getUserState
+            const positions = (data.assetPositions || []).map(pos => ({
+                coin: pos.position?.coin,
+                side: parseFloat(pos.position?.szi || '0') > 0 ? 'long' : 'short',
+                size: Math.abs(parseFloat(pos.position?.szi || '0')),
+                entryPrice: parseFloat(pos.position?.entryPx || '0'),
+                unrealizedPnl: parseFloat(pos.position?.unrealizedPnl || '0'),
+                leverage: parseFloat(pos.position?.leverage?.value || '0'),
+                raw: pos
+            })).filter(pos => pos.size > 0);
+
+            const marginSummary = data.marginSummary || {};
+            
+            const userState = {
+                balance: {
+                    accountValue: parseFloat(marginSummary.accountValue || '0'),
+                    withdrawable: parseFloat(data.withdrawable || '0'),
+                    totalMarginUsed: parseFloat(marginSummary.totalMarginUsed || '0')
+                },
+                positions: positions,
+                timestamp: Date.now()
+            };
+
+            this.emit('userState', userState);
+        }
+      } catch (error) {
+        // Ignore timeouts or inflight errors to prevent log spam
+        if (!error.message.includes('timeout') && !error.message.includes('inflight')) {
+            console.error('[Hyperliquid] WS user polling error:', error.message);
+        }
+      }
+    }, intervalMs);
   }
 
   /**
-   * Start global polling loop for all subscribed symbols
+   * Stop user polling
+   */
+  stopUserPollingWs() {
+    if (this.userPollTimer) {
+      clearInterval(this.userPollTimer);
+      this.userPollTimer = null;
+      console.log('[Hyperliquid] Stopped WS user polling');
+    }
+  }
+
+  /**
+   * Poll orderbook via WebSocket
+   * Uses a shared polling loop for all symbols to respect rate limits
    */
   startGlobalPolling() {
     if (this.globalPollingTimer) {
@@ -866,6 +935,7 @@ class HyperliquidConnector extends EventEmitter {
     this.stopPeriodicRestRefresh();
     this.stopStalenessMonitoring();
     this.stopGlobalPolling();
+    this.stopUserPollingWs();
 
     if (this.ws) {
       this.ws.close();

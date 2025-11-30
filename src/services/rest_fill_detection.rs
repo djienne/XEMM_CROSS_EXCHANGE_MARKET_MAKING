@@ -2,25 +2,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::interval;
-use tracing::debug;
+use tracing::{debug, info, warn, error};
 use colored::Colorize;
+use fast_float::parse;
 
 use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
+use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::util::cancel::dual_cancel;
 use crate::util::rate_limit::is_rate_limit_error;
-
-// Macro for timestamped colored output
-macro_rules! tprintln {
-    ($($arg:tt)*) => {{
-        println!("{} {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string().bright_black(),
-            format!($($arg)*)
-        );
-    }};
-}
 
 /// REST API fill detection service (backup/fallback method)
 ///
@@ -28,24 +19,29 @@ macro_rules! tprintln {
 /// missed by WebSocket. This provides redundancy and recovery capabilities.
 pub struct RestFillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
-    pub hedge_tx: mpsc::Sender<(OrderSide, f64, f64, std::time::Instant)>,
+    pub hedge_tx: mpsc::UnboundedSender<HedgeEvent>,
     pub pacifica_trading: Arc<PacificaTrading>,
     pub pacifica_ws_trading: Arc<PacificaWsTrading>,
     pub symbol: String,
-    pub processed_fills: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub min_hedge_notional: f64,
+    pub poll_interval_ms: u64,
 }
 
 impl RestFillDetectionService {
     pub async fn run(self) {
-        let mut poll_interval = interval(Duration::from_millis(500)); // Poll every 500ms (0.5s)
-        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
         let mut consecutive_errors = 0u32;
         let mut last_known_filled_amount: f64 = 0.0;
 
         loop {
-            poll_interval.tick().await;
+            // Adaptive polling: fast when order active, slow when idle
+            let has_active_order = {
+                let state = self.bot_state.read().await;
+                state.has_active_order_fast() || matches!(state.status, crate::bot::BotStatus::Filled | crate::bot::BotStatus::Hedging)
+            };
+
+            let poll_ms = if has_active_order { self.poll_interval_ms } else { 1000 };
+            tokio::time::sleep(Duration::from_millis(poll_ms)).await;
 
             // Get active order info, with recovery logic for recent cancellations
             let active_order_info = {
@@ -96,15 +92,15 @@ impl RestFillDetectionService {
                             orders.len()
                         );
                         orders.iter().filter(|o| o.symbol == self.symbol).find(|o| {
-                            let filled: f64 = o.filled_amount.parse().unwrap_or(0.0);
+                            let filled: f64 = parse(&o.filled_amount).unwrap_or(0.0);
                             filled > 0.0
                         })
                     };
 
                     if let Some(order) = our_order {
-                        let filled_amount: f64 = order.filled_amount.parse().unwrap_or(0.0);
-                        let initial_amount: f64 = order.initial_amount.parse().unwrap_or(0.0);
-                        let price: f64 = order.price.parse().unwrap_or(0.0);
+                        let filled_amount: f64 = parse(&order.filled_amount).unwrap_or(0.0);
+                        let initial_amount: f64 = parse(&order.initial_amount).unwrap_or(0.0);
+                        let price: f64 = parse(&order.price).unwrap_or(0.0);
 
                         // Check if there's a NEW fill (filled_amount increased since last check)
                         if filled_amount > last_known_filled_amount && filled_amount > 0.0 {
@@ -128,7 +124,7 @@ impl RestFillDetectionService {
                                 let fill_id = format!("{}_{}_rest", fill_type, cloid);
 
                                 // Check if already processed (prevent duplicate hedges from WebSocket)
-                                let mut processed = self.processed_fills.lock().await;
+                                let mut processed = self.processed_fills.lock();
                                 if processed.contains(&fill_id)
                                     || processed.contains(&format!("full_{}", cloid))
                                     || processed.contains(&format!("partial_{}", cloid))
@@ -157,7 +153,7 @@ impl RestFillDetectionService {
                                     }
                                 };
 
-                                tprintln!(
+                                info!(
                                     "{} {} {} FILL: {} {} {} @ {} | Filled: {} / {} | Notional: {} {}",
                                     "[REST_FILL_DETECTION]".bright_cyan().bold(),
                                     "✓".green().bold(),
@@ -186,14 +182,14 @@ impl RestFillDetectionService {
                                         state.mark_filled(filled_amount, order_side);
                                     }
 
-                                    tprintln!(
+                                    info!(
                                         "{} {} State updated to Filled (REST)",
                                         "[REST_FILL_DETECTION]".bright_cyan().bold(),
                                         "✓".green().bold()
                                     );
 
                                     // Dual cancellation
-                                    tprintln!(
+                                    info!(
                                         "{} {} Dual cancellation (REST + WebSocket)...",
                                         "[REST_FILL_DETECTION]".bright_cyan().bold(),
                                         "⚡".yellow().bold()
@@ -202,7 +198,7 @@ impl RestFillDetectionService {
                                     match dual_cancel(&pac_trading_clone, &pac_ws_trading_clone, &symbol_clone).await
                                     {
                                         Ok((rest_count, ws_count)) => {
-                                            tprintln!(
+                                            info!(
                                                 "{} {} Dual cancellation complete (REST: {}, WS: {})",
                                                 "[REST_FILL_DETECTION]".bright_cyan().bold(),
                                                 "✓✓".green().bold(),
@@ -211,7 +207,7 @@ impl RestFillDetectionService {
                                             );
                                         }
                                         Err(e) => {
-                                            tprintln!(
+                                            error!(
                                                 "{} {} Dual cancellation failed: {}",
                                                 "[REST_FILL_DETECTION]".bright_cyan().bold(),
                                                 "✗".red().bold(),
@@ -220,14 +216,14 @@ impl RestFillDetectionService {
                                         }
                                     }
 
-                                    tprintln!(
+                                    info!(
                                         "{} {}, triggering hedge (REST)",
                                         format!("[{}]", symbol_clone).bright_white().bold(),
                                         "Order filled".green().bold()
                                     );
 
                                     // Trigger hedge (with current timestamp since REST detection detects fills retroactively)
-                                    hedge_tx_clone.send((order_side, filled_amount, price, std::time::Instant::now())).await.ok();
+                                    let _ = hedge_tx_clone.send((order_side, filled_amount, price, std::time::Instant::now()));
                                 });
                             } else {
                                 debug!(
@@ -250,7 +246,7 @@ impl RestFillDetectionService {
                     if is_rate_limit {
                         // Exponential backoff for rate limits: 1s, 2s, 4s, 8s, 16s, 32s (max)
                         let backoff_secs = std::cmp::min(2u64.pow(consecutive_errors - 1), 32);
-                        tprintln!(
+                        warn!(
                             "{} {} Rate limit hit, backing off for {} seconds...",
                             "[REST_FILL_DETECTION]".bright_cyan().bold(),
                             "⚠".yellow().bold(),
@@ -266,7 +262,7 @@ impl RestFillDetectionService {
 
                         // If too many consecutive errors, log warning
                         if consecutive_errors >= 5 {
-                            tprintln!(
+                            warn!(
                                 "{} {} {} consecutive errors fetching open orders",
                                 "[REST_FILL_DETECTION]".bright_cyan().bold(),
                                 "⚠".yellow().bold(),

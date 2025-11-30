@@ -53,9 +53,19 @@ pub struct Config {
     #[serde(default = "default_hyperliquid_slippage")]
     pub hyperliquid_slippage: f64,
 
+    /// Use Hyperliquid WebSocket for hedge market orders (default: true).
+    /// When disabled, REST API is used for hedge execution.
+    #[serde(default = "default_hyperliquid_use_ws_for_hedge")]
+    pub hyperliquid_use_ws_for_hedge: bool,
+
     /// Pacifica REST API polling interval in seconds (complement to WebSocket)
     #[serde(default = "default_pacifica_rest_poll_interval")]
     pub pacifica_rest_poll_interval_secs: u64,
+
+    /// Pacifica REST poll interval for active orders (ms).
+    /// Used by REST fill detection to poll more frequently when an order is active.
+    #[serde(default = "default_pacifica_active_order_rest_poll_interval")]
+    pub pacifica_active_order_rest_poll_interval_ms: u64,
 }
 
 // Default values
@@ -103,8 +113,16 @@ fn default_hyperliquid_slippage() -> f64 {
     0.05 // 5%
 }
 
+fn default_hyperliquid_use_ws_for_hedge() -> bool {
+    true
+}
+
 fn default_pacifica_rest_poll_interval() -> u64 {
     2 // 2 seconds
+}
+
+fn default_pacifica_active_order_rest_poll_interval() -> u64 {
+    500 // 500 ms (safer than 100ms to avoid rate limits)
 }
 
 impl Default for Config {
@@ -122,7 +140,9 @@ impl Default for Config {
             profit_cancel_threshold_bps: default_profit_cancel_threshold(),
             order_refresh_interval_secs: default_order_refresh_interval(),
             hyperliquid_slippage: default_hyperliquid_slippage(),
+            hyperliquid_use_ws_for_hedge: default_hyperliquid_use_ws_for_hedge(),
             pacifica_rest_poll_interval_secs: default_pacifica_rest_poll_interval(),
+            pacifica_active_order_rest_poll_interval_ms: default_pacifica_active_order_rest_poll_interval(),
         }
     }
 }

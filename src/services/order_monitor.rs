@@ -1,26 +1,100 @@
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use parking_lot::Mutex;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
-use tracing::debug;
-use colored::Colorize;
+use tracing::{debug, info, warn};
 
 use crate::bot::{BotState, BotStatus};
 use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::pacifica::PacificaTrading;
-use crate::strategy::{Opportunity, OpportunityEvaluator, OrderSide};
+use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
-// Macro for timestamped colored output
-macro_rules! tprintln {
-    ($($arg:tt)*) => {{
-        println!("{} {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string().bright_black(),
-            format!($($arg)*)
-        );
-    }};
+// ============================================================================
+// ATOMIC STATUS FOR LOCK-FREE HOT PATH CHECKS
+// ============================================================================
+
+/// Atomic bot status for lock-free checks in hot path
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicBotStatus {
+    Idle = 0,
+    OrderPlaced = 1,
+    Filled = 2,
+    Hedging = 3,
+    Complete = 4,
 }
+
+impl From<&BotStatus> for AtomicBotStatus {
+    fn from(status: &BotStatus) -> Self {
+        match status {
+            BotStatus::Idle => AtomicBotStatus::Idle,
+            BotStatus::OrderPlaced => AtomicBotStatus::OrderPlaced,
+            BotStatus::Filled => AtomicBotStatus::Filled,
+            BotStatus::Hedging => AtomicBotStatus::Hedging,
+            BotStatus::Complete => AtomicBotStatus::Complete,
+            BotStatus::Error(_) => AtomicBotStatus::Idle, // Treat errors as idle for monitoring purposes
+        }
+    }
+}
+
+// ============================================================================
+// LIGHTWEIGHT ORDER SNAPSHOT (AVOID CLONING FULL ORDER)
+// ============================================================================
+
+/// Minimal order data needed for monitoring (avoids full clone)
+#[derive(Debug, Clone, Copy)]
+pub struct OrderSnapshot {
+    pub side: OrderSide,
+    pub price: f64,
+    pub size: f64,
+    pub initial_profit_bps: f64,
+    pub placed_at: Instant,
+}
+
+/// Shared order snapshot updated atomically by order placer
+/// Uses Option wrapped in Mutex for atomic swap semantics
+pub struct SharedOrderSnapshot {
+    inner: Mutex<Option<OrderSnapshot>>,
+}
+
+impl SharedOrderSnapshot {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self) -> Option<OrderSnapshot> {
+        *self.inner.lock()
+    }
+
+    #[inline]
+    pub fn set(&self, snapshot: Option<OrderSnapshot>) {
+        *self.inner.lock() = snapshot;
+    }
+}
+
+// ============================================================================
+// CANCELLATION REQUEST CHANNEL (DECOUPLE FROM HOT PATH)
+// ============================================================================
+
+/// Cancellation request sent from monitor to cancellation handler
+#[derive(Debug)]
+pub enum CancelRequest {
+    /// Cancel due to age expiry
+    AgeExpiry { symbol: String, reason: String },
+    /// Cancel due to profit deviation
+    ProfitDeviation { symbol: String, current_profit_bps: f64, deviation_bps: f64 },
+}
+
+// ============================================================================
+// ORDER MONITOR SERVICE (OPTIMIZED)
+// ============================================================================
 
 /// Order monitoring service
 ///
@@ -29,421 +103,394 @@ macro_rules! tprintln {
 /// 2. Profit deviation - cancels if profit drops > profit_cancel_threshold_bps
 /// 3. Periodic profit logging every 2 seconds
 ///
-/// Checks every 25ms (40 Hz) for fast response to market changes.
+/// Key optimizations:
+/// - Lock-free status check via atomic
+/// - No REST calls in hot loop (delegated to separate task)
+/// - No cloning (uses lightweight snapshot)
+/// - No allocations in hot path
 pub struct OrderMonitorService {
+    // Shared state (write lock only needed for mutations)
     pub bot_state: Arc<RwLock<BotState>>,
+    
+    // Lock-free status for hot path (updated by state manager)
+    pub atomic_status: Arc<AtomicU8>,
+    
+    // Lightweight order snapshot (updated when order placed)
+    pub order_snapshot: Arc<SharedOrderSnapshot>,
+    
+    // Price feeds (lock-free reads via parking_lot)
     pub pacifica_prices: Arc<Mutex<(f64, f64)>>,
     pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
+    
+    // Configuration
     pub config: Config,
     pub evaluator: OpportunityEvaluator,
+    
+    // Trading connectors (only used by cancellation task)
     pub pacifica_trading: Arc<PacificaTrading>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
+    
+    // Channel for cancel requests (decouples hot path from I/O)
+    pub cancel_tx: mpsc::Sender<CancelRequest>,
 }
 
 impl OrderMonitorService {
-    pub async fn run(self) {
-        let mut monitor_interval = interval(Duration::from_millis(25)); // Check every 25ms (40 Hz)
-        let mut log_interval = interval(Duration::from_secs(2)); // Log profit every 2 seconds
+    /// Create a new order monitor service with cancellation channel
+    pub fn new(
+        bot_state: Arc<RwLock<BotState>>,
+        atomic_status: Arc<AtomicU8>,
+        order_snapshot: Arc<SharedOrderSnapshot>,
+        pacifica_prices: Arc<Mutex<(f64, f64)>>,
+        hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
+        config: Config,
+        evaluator: OpportunityEvaluator,
+        pacifica_trading: Arc<PacificaTrading>,
+        hyperliquid_trading: Arc<HyperliquidTrading>,
+    ) -> (Self, mpsc::Receiver<CancelRequest>) {
+        // Bounded channel to prevent unbounded growth, but large enough to not block
+        let (cancel_tx, cancel_rx) = mpsc::channel(64);
+        
+        let service = Self {
+            bot_state,
+            atomic_status,
+            order_snapshot,
+            pacifica_prices,
+            hyperliquid_prices,
+            config,
+            evaluator,
+            pacifica_trading,
+            hyperliquid_trading,
+            cancel_tx,
+        };
+        
+        (service, cancel_rx)
+    }
 
-        // Rate limit tracking for cancellations
-        let mut cancel_rate_limit = RateLimitTracker::new();
+    /// Main monitoring loop - LATENCY CRITICAL
+    /// 
+    /// This loop runs at 1kHz and must complete each iteration in <1ms.
+    /// All I/O operations are delegated to separate tasks via channels.
+    pub async fn run_monitor_loop(&self) {
+        let mut monitor_interval = interval(Duration::from_millis(1));
+        
+        // Timing thresholds
+        let age_threshold = Duration::from_secs(self.config.order_refresh_interval_secs);
+        let profit_threshold = self.config.profit_cancel_threshold_bps;
 
         loop {
-            tokio::select! {
-                _ = monitor_interval.tick() => {
-                    let state = self.bot_state.read().await;
+            monitor_interval.tick().await;
 
-                    // Only monitor orders that are actively placed (not filled/hedging/complete)
-                    if !matches!(state.status, BotStatus::OrderPlaced) {
-                        continue;
-                    }
-
-                    let active_order = match &state.active_order {
-                        Some(order) => order.clone(),
-                        None => continue,
-                    };
-                    drop(state);
-
-            // Check 1: Order age (refresh if > order_refresh_interval_secs)
-            if active_order.placed_at.elapsed() > Duration::from_secs(self.config.order_refresh_interval_secs) {
-                // Check if we're in rate limit backoff period
-                if cancel_rate_limit.should_skip() {
-                    let remaining = cancel_rate_limit.remaining_backoff_secs();
-                    debug!("[MONITOR] Skipping age cancellation (rate limit backoff, {:.1}s remaining)", remaining);
-                    continue;
-                }
-
-                let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock().unwrap();
-                let age_ms = active_order.placed_at.elapsed().as_millis();
-
-                // *** CRITICAL FIX: Check if order has fills BEFORE cancelling ***
-                // If order is filled but WebSocket missed it, don't cancel - let REST fill detection handle it
-                let filled_check_result = self.pacifica_trading.get_open_orders().await;
-
-                match filled_check_result {
-                    Ok(orders) => {
-                        if let Some(order) = orders.iter().find(|o| o.client_order_id == active_order.client_order_id) {
-                            let filled_amount: f64 = order.filled_amount.parse().unwrap_or(0.0);
-
-                            if filled_amount > 0.0 {
-                                // Order has fills - DON'T cancel, let fill detection handle it
-                                tprintln!(
-                                    "{} Order age {}s but has FILLS ({}) - skipping cancellation, waiting for fill detection",
-                                    "[MONITOR]".yellow().bold(),
-                                    format!("{:.3}", age_ms as f64 / 1000.0).bright_white(),
-                                    filled_amount
-                                );
-                                continue;
-                            }
-                        } else {
-                            // Order not in open orders anymore (filled or already cancelled)
-                            debug!("[MONITOR] Order not in open orders, might be filled/cancelled already");
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        debug!("[MONITOR] Failed to check order fills before age cancellation: {}", e);
-                        // Continue with cancellation attempt (safer than leaving hanging orders)
-                    }
-                }
-
-                tprintln!(
-                    "{} Order age {}s (max {}s) | PAC: {} | HL: {}/{} → {}",
-                    "[MONITOR]".yellow().bold(),
-                    format!("{:.3}", age_ms as f64 / 1000.0).bright_white(),
-                    self.config.order_refresh_interval_secs,
-                    format!("${:.4}", active_order.price).cyan(),
-                    format!("${:.4}", hl_bid).cyan(),
-                    format!("${:.4}", hl_ask).cyan(),
-                    "Refreshing".yellow()
-                );
-
-                // Cancel all orders for this symbol (only if no fills detected above)
-                let cancel_result = self.pacifica_trading
-                    .cancel_all_orders(false, Some(&active_order.symbol), false)
-                    .await;
-
-                match cancel_result {
-                    Ok(_) => {
-                        // Success - reset rate limit tracking
-                        cancel_rate_limit.record_success();
-                    }
-                    Err(e) => {
-                        // Check if it's a rate limit error
-                        if is_rate_limit_error(&e) {
-                            cancel_rate_limit.record_error();
-                            let backoff_secs = cancel_rate_limit.get_backoff_secs();
-                            tprintln!(
-                                "{} {} Failed to cancel: Rate limit exceeded. Backing off for {}s (attempt #{})",
-                                "[MONITOR]".yellow().bold(),
-                                "⚠".yellow().bold(),
-                                backoff_secs,
-                                cancel_rate_limit.consecutive_errors()
-                            );
-                        } else {
-                            // Other error - log but don't backoff
-                            tprintln!("{} {} Failed to cancel order: {}", "[MONITOR]".yellow().bold(), "✗".red().bold(), e);
-                        }
-
-                        // Check if order is still active (might have been filled/cancelled)
-                        let state = self.bot_state.read().await;
-                        if state.active_order.is_none() {
-                            // Order already cleared by fill detection or another task
-                            continue;
-                        }
-                        drop(state);
-                        continue;
-                    }
-                }
-
-                // Clear active order ONLY if not filled/hedging
-                let mut state = self.bot_state.write().await;
-                match &state.status {
-                    BotStatus::OrderPlaced => {
-                        // Normal cancellation - safe to clear
-                        state.clear_active_order();
-                    }
-                    BotStatus::Filled | BotStatus::Hedging | BotStatus::Complete => {
-                        // Order was filled during cancellation - DO NOT reset to Idle
-                        debug!("[MONITOR] Order age check: state is {:?}, not clearing", state.status);
-                    }
-                    _ => {}
-                }
-                drop(state);
-
-                // Force fresh price fetch from REST API after cancellation (both exchanges)
-                // Pacifica REST API
-                {
-                    match self.pacifica_trading.get_best_bid_ask_rest(&self.config.symbol, self.config.agg_level).await {
-                        Ok(Some((bid, ask))) => {
-                            *self.pacifica_prices.lock().unwrap() = (bid, ask);
-                            tprintln!(
-                                "{} Refreshed Pacifica via REST: bid={}, ask={}",
-                                "[MONITOR]".yellow().bold(),
-                                format!("${:.6}", bid).cyan(),
-                                format!("${:.6}", ask).cyan()
-                            );
-                        }
-                        Ok(None) => {
-                            debug!("[MONITOR] No Pacifica bid/ask available from REST API");
-                        }
-                        Err(e) => {
-                            debug!("[MONITOR] Failed to fetch Pacifica prices: {}", e);
-                        }
-                    }
-                }
-
-                // Hyperliquid REST API
-                {
-                    match self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol).await {
-                        Ok(Some((bid, ask))) => {
-                            *self.hyperliquid_prices.lock().unwrap() = (bid, ask);
-                            tprintln!(
-                                "{} Refreshed Hyperliquid via REST: bid={}, ask={}",
-                                "[MONITOR]".yellow().bold(),
-                                format!("${:.6}", bid).cyan(),
-                                format!("${:.6}", ask).cyan()
-                            );
-                        }
-                        Ok(None) => {
-                            debug!("[MONITOR] No Hyperliquid bid/ask available from REST API");
-                        }
-                        Err(e) => {
-                            debug!("[MONITOR] Failed to fetch Hyperliquid prices: {}", e);
-                        }
-                    }
-                }
-
+            // FAST PATH: Lock-free status check
+            let status = self.atomic_status.load(Ordering::Acquire);
+            if status != AtomicBotStatus::OrderPlaced as u8 {
                 continue;
             }
 
-            // Check 2: Profit monitoring (cancel if drops > profit_cancel_threshold_bps)
-            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock().unwrap();
+            // Get order snapshot (single lock, no clone of complex types)
+            let snapshot = match self.order_snapshot.get() {
+                Some(s) => s,
+                None => continue,
+            };
 
+            // Get prices (parking_lot mutex is very fast for uncontended case)
+            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
             if hl_bid == 0.0 || hl_ask == 0.0 {
                 continue;
             }
 
-            // Create a temporary opportunity to recalculate profit
-            let temp_opp = Opportunity {
-                direction: active_order.side,
-                pacifica_price: active_order.price,
-                hyperliquid_price: 0.0, // Not used in recalculation
-                size: active_order.size,
-                initial_profit_bps: active_order.initial_profit_bps,
-                timestamp: 0,
-            };
+            let age = snapshot.placed_at.elapsed();
 
-            let current_profit = self.evaluator.recalculate_profit(&temp_opp, hl_bid, hl_ask);
-            let profit_change = active_order.initial_profit_bps - current_profit;
+            // Check 1: Age threshold
+            if age > age_threshold {
+                // Send cancel request (non-blocking)
+                let _ = self.cancel_tx.try_send(CancelRequest::AgeExpiry {
+                    symbol: self.config.symbol.clone(),
+                    reason: format!("age {}ms > {}s threshold", age.as_millis(), self.config.order_refresh_interval_secs),
+                });
+                continue;
+            }
+
+            // Check 2: Profit deviation (using raw method - no allocation)
+            let current_profit = self.evaluator.recalculate_profit_raw(
+                snapshot.side,
+                snapshot.price,
+                hl_bid,
+                hl_ask,
+            );
+            
+            // Consistent calculation: positive = profit dropped (bad)
+            let profit_change = snapshot.initial_profit_bps - current_profit;
             let profit_deviation = profit_change.abs();
 
-            if profit_deviation > self.config.profit_cancel_threshold_bps {
-                // Check if we're in rate limit backoff period
-                if cancel_rate_limit.should_skip() {
-                    let remaining = cancel_rate_limit.remaining_backoff_secs();
-                    debug!("[MONITOR] Skipping profit cancellation (rate limit backoff, {:.1}s remaining)", remaining);
+            if profit_deviation > profit_threshold {
+                // Send cancel request (non-blocking)
+                let _ = self.cancel_tx.try_send(CancelRequest::ProfitDeviation {
+                    symbol: self.config.symbol.clone(),
+                    current_profit_bps: current_profit,
+                    deviation_bps: profit_deviation,
+                });
+            }
+        }
+    }
+
+    /// Cancellation handler task - runs separately from hot path
+    /// 
+    /// Handles all I/O operations: REST API calls, state updates, logging
+    pub async fn run_cancellation_handler(
+        &self,
+        mut cancel_rx: mpsc::Receiver<CancelRequest>,
+    ) {
+        let mut rate_limit = RateLimitTracker::new();
+
+        while let Some(request) = cancel_rx.recv().await {
+            // Check rate limit backoff
+            if rate_limit.should_skip() {
+                debug!(
+                    "[CANCEL] Skipping cancellation (rate limit backoff, {:.1}s remaining)",
+                    rate_limit.remaining_backoff_secs()
+                );
+                continue;
+            }
+
+            // Double-check state hasn't changed (order might have filled)
+            let status = self.atomic_status.load(Ordering::Acquire);
+            if status != AtomicBotStatus::OrderPlaced as u8 {
+                debug!("[CANCEL] Skipping - status changed to {}", status);
+                continue;
+            }
+
+            // Get current snapshot for logging
+            let _snapshot = self.order_snapshot.get();
+
+            // Check for partial fills before cancelling
+            match self.check_for_fills().await {
+                FillCheckResult::HasFills(amount) => {
+                    info!(
+                        "[CANCEL] Order has fills ({}) - skipping cancellation, waiting for fill detection",
+                        amount
+                    );
                     continue;
                 }
-
-                let hedge_price = match active_order.side {
-                    OrderSide::Buy => hl_bid,
-                    OrderSide::Sell => hl_ask,
-                };
-
-                let age_ms = active_order.placed_at.elapsed().as_millis();
-                let change_direction = if profit_change > 0.0 { "dropped" } else { "increased" };
-                // *** CRITICAL FIX: Check if order has fills BEFORE cancelling ***
-                // If order is filled but WebSocket missed it, don't cancel - let REST fill detection handle it
-                let filled_check_result = self.pacifica_trading.get_open_orders().await;
-
-                match filled_check_result {
-                    Ok(orders) => {
-                        if let Some(order) = orders.iter().find(|o| o.client_order_id == active_order.client_order_id) {
-                            let filled_amount: f64 = order.filled_amount.parse().unwrap_or(0.0);
-
-                            if filled_amount > 0.0 {
-                                // Order has fills - DON'T cancel, let fill detection handle it
-                                tprintln!(
-                                    "{} Profit deviation {:.2} bps but order has FILLS ({}) - skipping cancellation",
-                                    "[MONITOR]".yellow().bold(),
-                                    profit_deviation,
-                                    filled_amount
-                                );
-                                continue;
-                            }
-                        } else {
-                            // Order not in open orders anymore (filled or already cancelled)
-                            debug!("[MONITOR] Order not in open orders during profit check, might be filled/cancelled");
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        debug!("[MONITOR] Failed to check order fills before profit cancellation: {}", e);
-                        // Continue with cancellation attempt (safer than leaving hanging orders)
-                    }
+                FillCheckResult::NotFound => {
+                    debug!("[CANCEL] Order not in open orders - might be filled/cancelled");
+                    continue;
                 }
-
-                tprintln!(
-                    "{} Profit: {} bps ({} {}) | PAC: {} | HL: {} | Age: {}s → {}",
-                    "[MONITOR]".yellow().bold(),
-                    if profit_change > 0.0 { format!("{:.2}", current_profit).red() } else { format!("{:.2}", current_profit).green() },
-                    change_direction,
-                    format!("{:.2}", profit_deviation).bright_white(),
-                    format!("${:.4}", active_order.price).cyan(),
-                    format!("${:.4}", hedge_price).cyan(),
-                    format!("{:.3}", age_ms as f64 / 1000.0).bright_white(),
-                    "Cancelling".yellow()
-                );
-
-                // Cancel all orders for this symbol (only if no fills detected above)
-                let cancel_result = self.pacifica_trading
-                    .cancel_all_orders(false, Some(&active_order.symbol), false)
-                    .await;
-
-                match cancel_result {
-                    Ok(_) => {
-                        // Success - reset rate limit tracking
-                        cancel_rate_limit.record_success();
-                    }
-                    Err(e) => {
-                        // Check if it's a rate limit error
-                        if is_rate_limit_error(&e) {
-                            cancel_rate_limit.record_error();
-                            let backoff_secs = cancel_rate_limit.get_backoff_secs();
-                            tprintln!(
-                                "{} {} Failed to cancel: Rate limit exceeded. Backing off for {}s (attempt #{})",
-                                "[MONITOR]".yellow().bold(),
-                                "⚠".yellow().bold(),
-                                backoff_secs,
-                                cancel_rate_limit.consecutive_errors()
-                            );
-                        } else {
-                            // Other error - log but don't backoff
-                            tprintln!("{} {} Failed to cancel order: {}", "[MONITOR]".yellow().bold(), "✗".red().bold(), e);
-                        }
-
-                        // Check if order is still active (might have been filled/cancelled)
-                        let state = self.bot_state.read().await;
-                        if state.active_order.is_none() {
-                            // Order already cleared by fill detection or another task
-                            continue;
-                        }
-                        drop(state);
-                        continue;
-                    }
+                FillCheckResult::NoFills => {
+                    // Safe to proceed with cancellation
                 }
-
-                // Clear active order ONLY if not filled/hedging
-                let mut state = self.bot_state.write().await;
-                match &state.status {
-                    BotStatus::OrderPlaced => {
-                        // Normal cancellation - safe to clear
-                        state.clear_active_order();
-                    }
-                    BotStatus::Filled | BotStatus::Hedging | BotStatus::Complete => {
-                        // Order was filled during cancellation - DO NOT reset to Idle
-                        debug!("[MONITOR] Profit check: state is {:?}, not clearing", state.status);
-                    }
-                    _ => {}
-                }
-                drop(state);
-
-                // Force fresh price fetch from REST API after cancellation (both exchanges)
-                // Pacifica REST API
-                {
-                    match self.pacifica_trading.get_best_bid_ask_rest(&self.config.symbol, self.config.agg_level).await {
-                        Ok(Some((bid, ask))) => {
-                            *self.pacifica_prices.lock().unwrap() = (bid, ask);
-                            tprintln!(
-                                "{} Refreshed Pacifica via REST: bid={}, ask={}",
-                                "[MONITOR]".yellow().bold(),
-                                format!("${:.6}", bid).cyan(),
-                                format!("${:.6}", ask).cyan()
-                            );
-                        }
-                        Ok(None) => {
-                            debug!("[MONITOR] No Pacifica bid/ask available from REST API");
-                        }
-                        Err(e) => {
-                            debug!("[MONITOR] Failed to fetch Pacifica prices: {}", e);
-                        }
-                    }
-                }
-
-                // Hyperliquid REST API
-                {
-                    match self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol).await {
-                        Ok(Some((bid, ask))) => {
-                            *self.hyperliquid_prices.lock().unwrap() = (bid, ask);
-                            tprintln!(
-                                "{} Refreshed Hyperliquid via REST: bid={}, ask={}",
-                                "[MONITOR]".yellow().bold(),
-                                format!("${:.6}", bid).cyan(),
-                                format!("${:.6}", ask).cyan()
-                            );
-                        }
-                        Ok(None) => {
-                            debug!("[MONITOR] No Hyperliquid bid/ask available from REST API");
-                        }
-                        Err(e) => {
-                            debug!("[MONITOR] Failed to fetch Hyperliquid prices: {}", e);
-                        }
-                    }
+                FillCheckResult::CheckFailed(e) => {
+                    debug!("[CANCEL] Fill check failed: {} - proceeding with cancellation", e);
+                    // Continue with cancellation (safer than leaving hanging orders)
                 }
             }
+
+            // Log the cancellation reason
+            match &request {
+                CancelRequest::AgeExpiry { reason, .. } => {
+                    info!("[CANCEL] Age expiry: {}", reason);
                 }
+                CancelRequest::ProfitDeviation { current_profit_bps, deviation_bps, .. } => {
+                    info!(
+                        "[CANCEL] Profit deviation: current={:.2} bps, deviation={:.2} bps",
+                        current_profit_bps, deviation_bps
+                    );
+                }
+            }
 
-                _ = log_interval.tick() => {
-                    // Periodic profit logging every 2 seconds
-                    let state = self.bot_state.read().await;
+            // Execute cancellation
+            let symbol = match &request {
+                CancelRequest::AgeExpiry { symbol, .. } => symbol,
+                CancelRequest::ProfitDeviation { symbol, .. } => symbol,
+            };
 
-                    // Only log profit for actively placed orders
-                    if !matches!(state.status, BotStatus::OrderPlaced) {
-                        continue;
+            match self.pacifica_trading.cancel_all_orders(false, Some(symbol), false).await {
+                Ok(_) => {
+                    rate_limit.record_success();
+                    
+                    // Clear state only if still in OrderPlaced
+                    let mut state = self.bot_state.write().await;
+                    if matches!(state.status, BotStatus::OrderPlaced) {
+                        state.clear_active_order();
+                        self.atomic_status.store(AtomicBotStatus::Idle as u8, Ordering::Release);
+                        self.order_snapshot.set(None);
                     }
-
-                    let active_order = match &state.active_order {
-                        Some(order) => order.clone(),
-                        None => continue,
-                    };
                     drop(state);
 
-                    let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock().unwrap();
-                    if hl_bid == 0.0 || hl_ask == 0.0 {
-                        continue;
+                    // Refresh prices in parallel (not blocking the handler)
+                    self.refresh_prices_parallel().await;
+                }
+                Err(e) => {
+                    if is_rate_limit_error(&e) {
+                        rate_limit.record_error();
+                        warn!(
+                            "[CANCEL] Rate limit exceeded. Backing off for {}s (attempt #{})",
+                            rate_limit.get_backoff_secs(),
+                            rate_limit.consecutive_errors()
+                        );
+                    } else {
+                        warn!("[CANCEL] Failed to cancel: {}", e);
                     }
-
-                    let temp_opp = Opportunity {
-                        direction: active_order.side,
-                        pacifica_price: active_order.price,
-                        hyperliquid_price: 0.0,
-                        size: active_order.size,
-                        initial_profit_bps: active_order.initial_profit_bps,
-                        timestamp: 0,
-                    };
-
-                    let current_profit = self.evaluator.recalculate_profit(&temp_opp, hl_bid, hl_ask);
-                    let profit_change = current_profit - active_order.initial_profit_bps;
-                    let age_ms = active_order.placed_at.elapsed().as_millis();
-
-                    let hedge_price = match active_order.side {
-                        OrderSide::Buy => hl_bid,
-                        OrderSide::Sell => hl_ask,
-                    };
-
-                    tprintln!(
-                        "{} Current: {} bps (initial: {}, change: {}) | PAC: {} | HL: {} | Age: {}s",
-                        "[PROFIT]".bright_blue().bold(),
-                        format!("{:.2}", current_profit).bright_white().bold(),
-                        format!("{:.2}", active_order.initial_profit_bps).bright_white(),
-                        if profit_change >= 0.0 { format!("{:+.2}", profit_change).green() } else { format!("{:+.2}", profit_change).red() },
-                        format!("${:.4}", active_order.price).cyan(),
-                        format!("${:.4}", hedge_price).cyan(),
-                        format!("{:.3}", age_ms as f64 / 1000.0).bright_white()
-                    );
                 }
             }
         }
     }
+
+    /// Periodic profit logging task - runs at 0.5 Hz (every 2 seconds)
+    pub async fn run_profit_logger(&self) {
+        let mut log_interval = interval(Duration::from_secs(2));
+
+        loop {
+            log_interval.tick().await;
+
+            // Only log for active orders
+            let status = self.atomic_status.load(Ordering::Acquire);
+            if status != AtomicBotStatus::OrderPlaced as u8 {
+                continue;
+            }
+
+            let snapshot = match self.order_snapshot.get() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
+            if hl_bid == 0.0 || hl_ask == 0.0 {
+                continue;
+            }
+
+            let current_profit = self.evaluator.recalculate_profit_raw(
+                snapshot.side,
+                snapshot.price,
+                hl_bid,
+                hl_ask,
+            );
+            let profit_change = current_profit - snapshot.initial_profit_bps;
+            let age_ms = snapshot.placed_at.elapsed().as_millis();
+
+            let hedge_price = match snapshot.side {
+                OrderSide::Buy => hl_bid,
+                OrderSide::Sell => hl_ask,
+            };
+
+            info!(
+                "[PROFIT] Current: {:.2} bps (initial: {:.2}, change: {:+.2}) | PAC: ${:.4} | HL: ${:.4} | Age: {:.3}s",
+                current_profit,
+                snapshot.initial_profit_bps,
+                profit_change,
+                snapshot.price,
+                hedge_price,
+                age_ms as f64 / 1000.0
+            );
+        }
+    }
+
+    /// Check if order has fills (called from cancellation handler, not hot path)
+    async fn check_for_fills(&self) -> FillCheckResult {
+        // Get client_order_id from full state (only in cancellation handler)
+        let state = self.bot_state.read().await;
+        let client_order_id = match &state.active_order {
+            Some(order) => order.client_order_id.clone(),
+            None => return FillCheckResult::NotFound,
+        };
+        drop(state);
+
+        match self.pacifica_trading.get_open_orders().await {
+            Ok(orders) => {
+                if let Some(order) = orders.iter().find(|o| o.client_order_id == client_order_id) {
+                    let filled_amount: f64 = fast_float::parse(&order.filled_amount).unwrap_or(0.0);
+                    if filled_amount > 0.0 {
+                        FillCheckResult::HasFills(filled_amount)
+                    } else {
+                        FillCheckResult::NoFills
+                    }
+                } else {
+                    FillCheckResult::NotFound
+                }
+            }
+            Err(e) => FillCheckResult::CheckFailed(e.to_string()),
+        }
+    }
+
+    /// Refresh prices from both exchanges in parallel
+    async fn refresh_prices_parallel(&self) {
+        let pac_future = self.pacifica_trading.get_best_bid_ask_rest(
+            &self.config.symbol,
+            self.config.agg_level,
+        );
+        let hl_future = self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol);
+
+        let (pac_result, hl_result) = tokio::join!(pac_future, hl_future);
+
+        if let Ok(Some((bid, ask))) = pac_result {
+            *self.pacifica_prices.lock() = (bid, ask);
+            debug!("[REFRESH] Pacifica: bid=${:.6}, ask=${:.6}", bid, ask);
+        }
+
+        if let Ok(Some((bid, ask))) = hl_result {
+            *self.hyperliquid_prices.lock() = (bid, ask);
+            debug!("[REFRESH] Hyperliquid: bid=${:.6}, ask=${:.6}", bid, ask);
+        }
+    }
+}
+
+/// Result of checking for partial fills
+enum FillCheckResult {
+    HasFills(f64),
+    NoFills,
+    NotFound,
+    CheckFailed(String),
+}
+
+// ============================================================================
+// HELPER: Update atomic status when BotState changes
+// ============================================================================
+
+/// Call this whenever BotState.status changes to keep atomic in sync
+#[inline]
+pub fn sync_atomic_status(atomic: &AtomicU8, status: &BotStatus) {
+    let atomic_val = AtomicBotStatus::from(status) as u8;
+    atomic.store(atomic_val, Ordering::Release);
+}
+
+/// Call this when placing a new order to update snapshot
+#[inline]
+pub fn update_order_snapshot(
+    snapshot: &SharedOrderSnapshot,
+    side: OrderSide,
+    price: f64,
+    size: f64,
+    initial_profit_bps: f64,
+) {
+    snapshot.set(Some(OrderSnapshot {
+        side,
+        price,
+        size,
+        initial_profit_bps,
+        placed_at: Instant::now(),
+    }));
+}
+
+// ============================================================================
+// STARTUP HELPER
+// ============================================================================
+
+/// Spawn all monitor tasks
+pub fn spawn_monitor_tasks(service: Arc<OrderMonitorService>, cancel_rx: mpsc::Receiver<CancelRequest>) {
+    // Hot path monitor (1kHz)
+    let service_clone = Arc::clone(&service);
+    tokio::spawn(async move {
+        service_clone.run_monitor_loop().await;
+    });
+
+    // Cancellation handler (processes cancel requests)
+    let service_clone = Arc::clone(&service);
+    tokio::spawn(async move {
+        service_clone.run_cancellation_handler(cancel_rx).await;
+    });
+
+    // Profit logger (0.5 Hz)
+    let service_clone = Arc::clone(&service);
+    tokio::spawn(async move {
+        service_clone.run_profit_logger().await;
+    });
 }

@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XEMM Bot Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>XEMM Bot Dashboard</h1>
+            <div id="status-indicator" class="status-badge unknown">
+                <span class="status-dot"></span>
+                <span id="status-text">Checking...</span>
+            </div>
+        </header>
+
+        <div class="status-description">
+            <p id="status-detail">Checking bot status...</p>
+        </div>
+
+        <div class="main-layout">
+            <aside class="sidebar left">
+                <section class="card parameters">
+                    <h2>Bot Parameters</h2>
+                    <div id="config-viewer" class="config-list">Loading config...</div>
+                </section>
+            </aside>
+
+            <main class="content">
+                <!-- Trade Statistics -->
+                <section class="card stats">
+                    <div class="card-header">
+                        <h2>Trade Statistics</h2>
+                        <button class="btn btn-sm" onclick="refreshTradeStats()">Refresh</button>
+                    </div>
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <span class="stat-label">Total Trades</span>
+                            <span class="stat-value" id="stat-total">0</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">Total P&L</span>
+                            <span class="stat-value" id="stat-pnl">$0.00</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">Avg Profit</span>
+                            <span class="stat-value" id="stat-avg">$0.00</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">Win Rate</span>
+                            <span class="stat-value" id="stat-winrate">0%</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">Symbol</span>
+                            <span class="stat-value" id="stat-symbol">-</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">Avg Latency</span>
+                            <span class="stat-value" id="stat-latency">0ms</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Control Panel -->
+                <section class="card controls">
+                    <h2>Controls</h2>
+                    <div class="button-group">
+                        <button id="btn-start" class="btn btn-success" onclick="startBot()">
+                            <span class="icon">▶</span> Start Bot
+                        </button>
+                        <button id="btn-stop" class="btn btn-danger" onclick="stopBot()">
+                            <span class="icon">⏹</span> Stop Bot
+                        </button>
+                        <button id="btn-deploy" class="btn btn-primary" onclick="deployBot()">
+                            <span class="icon">🚀</span> Deploy
+                        </button>
+                        <button id="btn-refresh" class="btn btn-secondary" onclick="checkStatus()">
+                            <span class="icon">🔄</span> Refresh Status
+                        </button>
+                    </div>
+                    <div id="action-output" class="console-output hidden"></div>
+                </section>
+
+                <!-- Logs Viewer -->
+                <section class="card logs">
+                    <div class="card-header">
+                        <h2>Remote Logs</h2>
+                        <div class="log-controls">
+                            <select id="log-lines">
+                                <option value="50">50 lines</option>
+                                <option value="100" selected>100 lines</option>
+                                <option value="500">500 lines</option>
+                            </select>
+                            <button class="btn btn-sm" onclick="fetchLogs()">Refresh Logs</button>
+                        </div>
+                    </div>
+                    <div id="log-viewer" class="console-output">Loading logs...</div>
+                </section>
+            </main>
+
+            <aside class="sidebar right">
+                <!-- Trades Viewer -->
+                <section class="card trades">
+                    <div class="card-header">
+                        <h2>Recent Trades</h2>
+                    </div>
+                    <div class="table-container">
+                        <table id="trades-table">
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>Symbol</th>
+                                    <th>Side</th>
+                                    <th>Profit</th>
+                                    <th>Latency</th>
+                                </tr>
+                            </thead>
+                            <tbody id="trades-body">
+                                <tr>
+                                    <td colspan="5" class="text-center">No trades loaded</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </aside>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+
+</html>

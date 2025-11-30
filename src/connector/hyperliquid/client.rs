@@ -14,7 +14,6 @@ pub struct OrderbookConfig {
     pub coin: String,
     pub reconnect_attempts: u32,
     pub ping_interval_secs: u64,
-    pub request_interval_ms: u64,  // How often to request L2 book data
 }
 
 impl Default for OrderbookConfig {
@@ -23,7 +22,6 @@ impl Default for OrderbookConfig {
             coin: "BTC".to_string(),
             reconnect_attempts: 5,
             ping_interval_secs: 30,
-            request_interval_ms: 100,  // Request orderbook every 100ms
         }
     }
 }
@@ -32,7 +30,6 @@ impl Default for OrderbookConfig {
 pub struct OrderbookClient {
     config: OrderbookConfig,
     ws_url: String,
-    request_id: u64,
 }
 
 impl OrderbookClient {
@@ -46,7 +43,6 @@ impl OrderbookClient {
         Ok(Self {
             config,
             ws_url: MAINNET_WS_URL.to_string(),
-            request_id: 0,
         })
     }
 
@@ -111,13 +107,22 @@ impl OrderbookClient {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Create intervals for ping and L2 book requests
-        let mut ping_interval = interval(Duration::from_secs(self.config.ping_interval_secs));
-        let mut request_interval = interval(Duration::from_millis(self.config.request_interval_ms));
+        // Subscribe to L2 book
+        let subscribe_msg = SubscriptionMessage {
+            method: "subscribe".to_string(),
+            subscription: SubscriptionParams {
+                type_: "l2Book".to_string(),
+                coin: self.config.coin.clone(),
+            },
+        };
+        let subscribe_json = serde_json::to_string(&subscribe_msg)?;
+        debug!("[HYPERLIQUID] Sending subscription: {}", subscribe_json);
+        write.send(Message::Text(subscribe_json)).await?;
+        info!("[HYPERLIQUID] Subscribed to l2Book for {}", self.config.coin);
 
-        // Skip first tick (fires immediately)
-        ping_interval.tick().await;
-        request_interval.tick().await;
+        // Create interval for ping
+        let mut ping_interval = interval(Duration::from_secs(self.config.ping_interval_secs));
+        ping_interval.tick().await; // Skip first tick
 
         loop {
             tokio::select! {
@@ -150,31 +155,8 @@ impl OrderbookClient {
                 // Send ping periodically
                 _ = ping_interval.tick() => {
                     debug!("[HYPERLIQUID] Sending ping");
-                    let ping_msg = PingMessage::new();
-                    let ping_json = serde_json::to_string(&ping_msg)?;
-                    write.send(Message::Text(ping_json)).await?;
-                }
-
-                // Request L2 book data periodically
-                _ = request_interval.tick() => {
-                    self.request_id += 1;
-                    let request = L2BookRequest {
-                        method: "post".to_string(),
-                        id: self.request_id,
-                        request: L2BookRequestInner {
-                            type_: "info".to_string(),
-                            payload: L2BookPayload {
-                                type_: "l2Book".to_string(),
-                                coin: self.config.coin.clone(),
-                                n_sig_figs: Some(5),
-                                mantissa: None,
-                            },
-                        },
-                    };
-
-                    let request_json = serde_json::to_string(&request)?;
-                    debug!("[HYPERLIQUID] Requesting L2 book (id={})", self.request_id);
-                    write.send(Message::Text(request_json)).await?;
+                    debug!("[HYPERLIQUID] Sending ping");
+                    write.send(Message::Ping(vec![])).await?;
                 }
             }
         }
@@ -198,11 +180,11 @@ impl OrderbookClient {
         };
 
         match response.channel.as_str() {
-            "post" => {
-                // Parse L2 book response
-                match serde_json::from_str::<L2BookResponse>(text) {
+            "l2Book" => {
+                // Parse L2 book subscription response
+                match serde_json::from_str::<L2BookSubscriptionResponse>(text) {
                     Ok(l2_response) => {
-                        let book_data = &l2_response.data.response.payload.data;
+                        let book_data = &l2_response.data;
 
                         // Extract top of book
                         if let Some(tob) = book_data.get_top_of_book() {
@@ -215,9 +197,13 @@ impl OrderbookClient {
                         }
                     }
                     Err(e) => {
-                        debug!("[HYPERLIQUID] Failed to parse L2 book: {}", e);
+                        debug!("[HYPERLIQUID] Failed to parse L2 book subscription: {}", e);
                     }
                 }
+            }
+            "post" => {
+                // Keep for backward compatibility or other post requests
+                debug!("[HYPERLIQUID] Received post response (unexpected for subscription model)");
             }
             "pong" => {
                 debug!("[HYPERLIQUID] Received pong response");

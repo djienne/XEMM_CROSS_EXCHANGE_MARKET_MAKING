@@ -29,7 +29,6 @@ async fn main() -> anyhow::Result<()> {
         coin: app_config.symbol,
         reconnect_attempts: app_config.reconnect_attempts,
         ping_interval_secs: app_config.ping_interval_secs,
-        request_interval_ms: 500,  // Request every 500ms (2 updates per second)
     };
 
     // Create client
